@@ -24,6 +24,8 @@ const FRESHNESS_THRESHOLD_MS = 60 * 60 * 1000
  *     storyCount: number }
  */
 export async function GET() {
+  const t0 = Date.now()
+  console.log(`[Status][${new Date().toISOString().slice(11, 23)}] GET /api/home/status called`)
   try {
     const supabase = getSupabaseAdmin()
     const now = Date.now()
@@ -48,34 +50,43 @@ export async function GET() {
         ? (activeLock.details as { started_at: string }).started_at
         : null
 
+    console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Lock check: activeLock=${!!activeLock} refreshStartedAt=${refreshStartedAt ?? 'none'}`)
+
     // ── 2. Last successful ingestion timestamp ─────────────────────────────
     const lastIngestion = await getLastIngestionAt().catch(() => null)
     const ageMs = lastIngestion ? now - lastIngestion.getTime() : null
     const ageSeconds = ageMs !== null ? Math.round(ageMs / 1000) : null
 
+    console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Last ingestion: ${lastIngestion?.toISOString() ?? 'never'} (age: ${ageSeconds ?? 'n/a'}s)`)
+
     // ── 3. Current story count in homepage_story_cache ─────────────────────
+    // Use a high limit just to get the count — we don't return stories here
     const stories = await getHomeStories(20, 0).catch(() => [])
     const storyCount = stories.length
 
+    console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Story count in cache: ${storyCount}`)
+
     // ── 4. Derive status ───────────────────────────────────────────────────
+    // Ready = active lock resolved, last ingestion <1h ago, and at least 3 stories cached.
+    // We only need 3 because the initial segment generates 3 cards before returning.
+    const MIN_STORIES_FOR_READY = 3
     let status: 'ready' | 'refreshing' | 'stale' | 'error'
 
     if (activeLock) {
-      // A refresh is in flight
       status = 'refreshing'
-    } else if (!lastIngestion || ageMs === null || ageMs > FRESHNESS_THRESHOLD_MS || storyCount === 0) {
-      // No recent success — stale or never run
+    } else if (!lastIngestion || ageMs === null || ageMs > FRESHNESS_THRESHOLD_MS || storyCount < MIN_STORIES_FOR_READY) {
       status = 'stale'
-
-      // Kick off a background refresh so the next poll will find data
+      console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Status=stale — triggering background refresh`)
       after(async () => {
         await refreshSegment('all').catch((err) => {
-          console.error('[Status] Background refresh triggered by /api/home/status failed:', err)
+          console.error(`[Status][${new Date().toISOString().slice(11, 23)}] Background refresh failed:`, err)
         })
       })
     } else {
       status = 'ready'
     }
+
+    console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Response: status=${status} storyCount=${storyCount} ageSeconds=${ageSeconds ?? 'n/a'} (took ${Date.now() - t0}ms)`)
 
     return NextResponse.json({
       status,
@@ -85,7 +96,7 @@ export async function GET() {
       storyCount,
     })
   } catch (error) {
-    console.error('[API Error] /api/home/status failed:', error)
+    console.error(`[Status][${new Date().toISOString().slice(11, 23)}] GET /api/home/status threw:`, error)
     return NextResponse.json(
       {
         status: 'error',

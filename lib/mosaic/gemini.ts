@@ -3,6 +3,17 @@ import { z } from 'zod'
 import { getEnv, getOptionalEnv, createMosaicError } from './env'
 import type { ArticleExtraction, ComparisonAnalysis, HomeStory, NarrativeAnalysis, NormalizedArticle } from './types'
 
+// ── Logging ──────────────────────────────────────────────────────────────────
+function ts() { return new Date().toISOString().slice(11, 23) }
+function log(msg: string, extra?: unknown) {
+  const line = `[Gemini][${ts()}] ${msg}`
+  if (extra !== undefined) console.log(line, typeof extra === 'object' ? JSON.stringify(extra) : extra)
+  else console.log(line)
+}
+function logErr(msg: string, err?: unknown) {
+  console.error(`[Gemini][${ts()}] ERROR: ${msg}`, err ?? '')
+}
+
 const HOMEPAGE_MODELS = modelsFromEnv('GEMINI_HOMEPAGE_MODELS', ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash-lite'])
 const ANALYSIS_MODELS = modelsFromEnv('GEMINI_ANALYSIS_MODELS', ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash-lite'])
 
@@ -73,15 +84,23 @@ async function generateJson<T>(
   validator?: z.ZodType<T>,
 ): Promise<T> {
   const failures: Array<{ model: string; error: unknown }> = []
+  log(`generateJson → trying ${models.length} model(s): [${models.join(', ')}]`)
 
   for (const model of models) {
     try {
-      return await generateJsonWithModel<T>(model, prompt, responseSchema, validator)
+      log(`generateJson → attempting model "${model}"`)
+      const t0 = Date.now()
+      const result = await generateJsonWithModel<T>(model, prompt, responseSchema, validator)
+      log(`generateJson → model "${model}" succeeded in ${Date.now() - t0}ms`)
+      return result
     } catch (error) {
-      failures.push({ model, error: normalizeGeminiError(error) })
+      const normalized = normalizeGeminiError(error)
+      logErr(`generateJson → model "${model}" failed`, normalized)
+      failures.push({ model, error: normalized })
     }
   }
 
+  logErr(`generateJson → ALL models failed`, { failures })
   throw createMosaicError('GEMINI_ALL_MODELS_FAILED', 'All configured Gemini models failed for this structured JSON generation.', { failures })
 }
 
@@ -91,6 +110,8 @@ async function generateJsonWithModel<T>(
   responseSchema: Record<string, unknown>,
   validator?: z.ZodType<T>,
 ): Promise<T> {
+  const t0 = Date.now()
+  log(`generateJsonWithModel → calling ${model} (prompt length: ${prompt.length} chars)`)
   const response = await getClient().models.generateContent({
     model,
     contents: prompt,
@@ -103,18 +124,25 @@ async function generateJsonWithModel<T>(
   })
 
   const text = response.text
-  if (!text) throw createMosaicError('GEMINI_EMPTY_RESPONSE', `Gemini ${model} returned an empty JSON response.`)
+  if (!text) {
+    logErr(`generateJsonWithModel → ${model} returned empty response after ${Date.now() - t0}ms`)
+    throw createMosaicError('GEMINI_EMPTY_RESPONSE', `Gemini ${model} returned an empty JSON response.`)
+  }
+
+  log(`generateJsonWithModel → ${model} responded in ${Date.now() - t0}ms (${text.length} chars)`)
 
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch (error) {
+    logErr(`generateJsonWithModel → ${model} returned invalid JSON`, { error, textPreview: text.slice(0, 200) })
     throw createMosaicError('GEMINI_JSON_PARSE_FAILED', `Gemini ${model} returned invalid JSON.`, { error, text })
   }
 
   if (validator) {
     const result = validator.safeParse(parsed)
     if (!result.success) {
+      logErr(`generateJsonWithModel → ${model} failed schema validation`, result.error.issues)
       throw createMosaicError('GEMINI_VALIDATION_FAILED', `Gemini ${model} output failed schema validation.`, {
         validationError: result.error.issues,
         text,

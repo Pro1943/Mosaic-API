@@ -13,6 +13,17 @@ import { createMosaicError } from './env'
 
 const ONE_HOUR_MS = 60 * 60 * 1000
 
+// ── Logging ──────────────────────────────────────────────────────────────────
+function ts() { return new Date().toISOString().slice(11, 23) }
+function log(msg: string, extra?: unknown) {
+  const line = `[DB][${ts()}] ${msg}`
+  if (extra !== undefined) console.log(line, typeof extra === 'object' ? JSON.stringify(extra) : extra)
+  else console.log(line)
+}
+function logErr(msg: string, err?: unknown) {
+  console.error(`[DB][${ts()}] ERROR: ${msg}`, err ?? '')
+}
+
 type TopicRow = {
   id: string
   title_hint: string
@@ -40,13 +51,20 @@ export async function getLastIngestionAt() {
     .limit(1)
     .maybeSingle()
 
-  if (error) throw createMosaicError('SUPABASE_SELECT_FAILED', 'Could not read ingestion status from Supabase.', error)
-  return data?.finished_at ? new Date(data.finished_at) : null
+  if (error) {
+    logErr('getLastIngestionAt failed', error)
+    throw createMosaicError('SUPABASE_SELECT_FAILED', 'Could not read ingestion status from Supabase.', error)
+  }
+  const result = data?.finished_at ? new Date(data.finished_at) : null
+  log(`getLastIngestionAt → ${result?.toISOString() ?? 'null (never run)'}`)
+  return result
 }
 
 export async function needsIngestion() {
   const last = await getLastIngestionAt()
-  return !last || Date.now() - last.getTime() > ONE_HOUR_MS
+  const needs = !last || Date.now() - last.getTime() > ONE_HOUR_MS
+  log(`needsIngestion → ${needs} (last: ${last?.toISOString() ?? 'never'})`)
+  return needs
 }
 
 export async function acquireIngestionLease(leaseTimeoutMs = 5 * 60 * 1000): Promise<boolean> {
@@ -68,6 +86,7 @@ export async function acquireIngestionLease(leaseTimeoutMs = 5 * 60 * 1000): Pro
   })
 
   if (activeLock) {
+    log(`acquireIngestionLease → DENIED (active lock id=${activeLock.id})`)
     return false
   }
 
@@ -77,7 +96,12 @@ export async function acquireIngestionLease(leaseTimeoutMs = 5 * 60 * 1000): Pro
     finished_at: now.toISOString(),
   })
 
-  return !error
+  if (error) {
+    logErr('acquireIngestionLease insert failed', error)
+    return false
+  }
+  log('acquireIngestionLease → ACQUIRED')
+  return true
 }
 
 export async function releaseIngestionLease() {
@@ -95,6 +119,9 @@ export async function releaseIngestionLease() {
 
   if (lockIds.length > 0) {
     await supabase.from('ingestion_runs').delete().in('id', lockIds)
+    log(`releaseIngestionLease → deleted ${lockIds.length} lock row(s)`)
+  } else {
+    log('releaseIngestionLease → no lock rows found to delete')
   }
 }
 
@@ -106,10 +133,15 @@ export async function recordIngestionRun(status: 'success' | 'failed', details: 
     finished_at: new Date().toISOString(),
   })
 
-  if (error) throw createMosaicError('SUPABASE_INSERT_FAILED', 'Could not record ingestion status in Supabase.', error)
+  if (error) {
+    logErr(`recordIngestionRun(${status}) insert failed`, error)
+    throw createMosaicError('SUPABASE_INSERT_FAILED', 'Could not record ingestion status in Supabase.', error)
+  }
+  log(`recordIngestionRun → status=${status}`, details)
 }
 
 export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
+  log(`upsertArticlesAndTopics → ${articles.length} articles`)
   const supabase = getSupabaseAdmin()
   const articleRows = articles.map((article) => ({
     id: stableHash(article.url),
@@ -342,19 +374,20 @@ export async function deleteInvalidTopics() {
   }
 }
 
-export async function getTopicsNeedingHomepageCards() {
+export async function getTopicsNeedingHomepageCards(limit = 8) {
   const supabase = getSupabaseAdmin()
   const { data, error } = await supabase
     .from('topics')
     .select('id, title_hint, created_at, updated_at')
     .order('updated_at', { ascending: false })
-    .limit(8)
+    .limit(limit)
 
   if (error) throw createMosaicError('SUPABASE_TOPICS_SELECT_FAILED', 'Could not read topics from Supabase.', error)
+  log(`getTopicsNeedingHomepageCards(limit=${limit}) → ${(data ?? []).length} topics`)
   return (data ?? []) as TopicRow[]
 }
 
-export async function getHomeStories(limit = 6, offset = 0): Promise<HomeStory[]> {
+export async function getHomeStories(limit = 3, offset = 0): Promise<HomeStory[]> {
   const supabase = getSupabaseAdmin()
   const { data, error } = await supabase
     .from('homepage_story_cache')
@@ -363,7 +396,11 @@ export async function getHomeStories(limit = 6, offset = 0): Promise<HomeStory[]
     .order('source_count', { ascending: false })
     .range(offset, offset + limit - 1)
 
-  if (error) throw createMosaicError('SUPABASE_HOME_STORIES_SELECT_FAILED', 'Could not read homepage stories from Supabase.', error)
+  if (error) {
+    logErr('getHomeStories failed', error)
+    throw createMosaicError('SUPABASE_HOME_STORIES_SELECT_FAILED', 'Could not read homepage stories from Supabase.', error)
+  }
+  log(`getHomeStories(limit=${limit}, offset=${offset}) → ${(data ?? []).length} stories`)
   return (data ?? []) as HomeStory[]
 }
 
