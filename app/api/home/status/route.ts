@@ -78,7 +78,7 @@ export async function GET() {
       status = 'stale'
       console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Status=stale — triggering background refresh`)
       after(async () => {
-        await refreshSegment('all').catch((err) => {
+        await refreshSegment('initial').catch((err) => {
           console.error(`[Status][${new Date().toISOString().slice(11, 23)}] Background refresh failed:`, err)
         })
       })

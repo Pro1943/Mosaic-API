@@ -62,8 +62,15 @@ export async function getLastIngestionAt() {
 
 export async function needsIngestion() {
   const last = await getLastIngestionAt()
-  const needs = !last || Date.now() - last.getTime() > ONE_HOUR_MS
-  log(`needsIngestion → ${needs} (last: ${last?.toISOString() ?? 'never'})`)
+  const { data: cached, error } = await getSupabaseAdmin()
+    .from('homepage_story_cache')
+    .select('topic_id')
+    .limit(1)
+
+  const hasStories = !error && (cached ?? []).length > 0
+  const isStale = !last || Date.now() - last.getTime() > ONE_HOUR_MS
+  const needs = !hasStories || isStale
+  log(`needsIngestion → ${needs} (hasStories: ${hasStories}, isStale: ${isStale}, last: ${last?.toISOString() ?? 'never'})`)
   return needs
 }
 

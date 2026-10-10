@@ -86,27 +86,41 @@ export async function getCachedHomepage(limit = 3, offset = 0): Promise<HomeStor
 
 export async function generateMoreHomepageCards(count = 3): Promise<HomeStory[]> {
   log('generateMore', `Requesting ${count} additional uncached topic cards`)
-  const topics = await getUncachedTopics(count)
+  const topics = await getUncachedTopics(count * 2)
   if (!topics.length) {
     log('generateMore', 'No uncached topics found — nothing to generate')
     return []
   }
-  log('generateMore', `Found ${topics.length} uncached topics, generating cards (concurrency 4)`)
+  log('generateMore', `Found ${topics.length} candidate uncached topics, checking articles`)
 
-  const generated = await mapWithConcurrency(topics, 4, async (topic) => {
-    const articles = await getArticlesForTopic(topic.id)
-    if (articles.length < 2) {
-      log('generateMore', `Skipping topic ${topic.id} — only ${articles.length} article(s)`)
-      return null
-    }
+  const topicArticles = await Promise.all(
+    topics.map(async (topic) => ({
+      topic,
+      articles: await getArticlesForTopic(topic.id),
+    })),
+  )
+
+  const multiSource = topicArticles.filter((t) => t.articles.length >= 2)
+  const singleSource = topicArticles.filter((t) => t.articles.length === 1)
+  const selected = [...multiSource, ...singleSource].slice(0, count)
+
+  log('generateMore', `Selected ${selected.length} topics (multi: ${multiSource.length}, single: ${singleSource.length})`)
+
+  const generated = await mapWithConcurrency(selected, 4, async ({ topic, articles }) => {
+    if (articles.length === 0) return null
     log('generateMore', `Generating card for topic "${topic.title_hint}" (${articles.length} articles)`)
     const t0 = Date.now()
-    const card = await generateHomepageCardForTopic({
-      topic_id: topic.id,
-      articles: articles.map(articleRowToNormalized),
-    })
-    log('generateMore', `Card done for "${topic.title_hint}" in ${Date.now() - t0}ms`)
-    return card
+    try {
+      const card = await generateHomepageCardForTopic({
+        topic_id: topic.id,
+        articles: articles.map(articleRowToNormalized),
+      })
+      log('generateMore', `Card done for "${topic.title_hint}" in ${Date.now() - t0}ms`)
+      return card
+    } catch (err) {
+      logErr('generateMore', `Card failed for "${topic.title_hint}"`, err)
+      return null
+    }
   })
 
   const stories = generated.filter(Boolean) as HomeStory[]
@@ -119,7 +133,7 @@ export async function generateMoreHomepageCards(count = 3): Promise<HomeStory[]>
 
 // ── Segment refresh ────────────────────────────────────────────────────────────
 
-export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'all') {
+export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'initial') {
   log('refreshSegment', `Starting segment="${segment}"`)
 
   const acquired = await acquireIngestionLease()
@@ -127,7 +141,7 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'all'
     log('refreshSegment', 'Could not acquire lease — another refresh is running')
     const stale = await needsIngestion()
     if (!stale) {
-      const existing = await getHomeStories()
+      const existing = await getHomeStories(3, 0)
       log('refreshSegment', `Lease busy but data is fresh — ${existing.length} stories available`)
       return { story_count: existing.length }
     }
@@ -140,96 +154,96 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'all'
     log('refreshSegment', `needsIngestion=${stale}`)
 
     if (stale) {
-      log('refreshSegment', 'Data is stale — running cleanup and fetch')
+      log('refreshSegment', 'Data is stale or cache is empty — running cleanup and fetch')
       await deleteOldStories(5)
-      log('refreshSegment', 'Deleted stories older than 5 days')
 
       if (segment === 'initial') {
-        // ── Initial segment: GNews only → generate first 3 cards fast ─────
-        log('initial', 'Fetching GNews articles')
+        // ── Chunk 1: GNews + NewsData in parallel (~20 articles, fast) ─────
+        log('initial', 'Fetching Chunk 1 (GNews + NewsData in parallel)')
         const t0 = Date.now()
-        const p1 = await fetchGNews().catch((err) => {
-          logErr('initial', 'GNews fetch failed', err)
-          return null
-        })
+        const [p1, p2] = await Promise.all([
+          fetchGNews().catch((err) => { logErr('initial', 'GNews fetch failed', err); return null }),
+          fetchNewsData().catch((err) => { logErr('initial', 'NewsData fetch failed', err); return null }),
+        ])
+        const chunk1Articles = [...(p1?.articles ?? []), ...(p2?.articles ?? [])]
+        log('initial', `Chunk 1 returned ${chunk1Articles.length} articles in ${Date.now() - t0}ms`)
 
-        if (p1 && p1.articles.length) {
-          log('initial', `GNews returned ${p1.articles.length} articles in ${Date.now() - t0}ms`)
-          await upsertArticlesAndTopics(p1.articles)
-          log('initial', 'GNews articles upserted to Supabase')
+        if (chunk1Articles.length > 0) {
+          await upsertArticlesAndTopics(chunk1Articles)
+          log('initial', 'Articles upserted to Supabase')
           await deleteInvalidTopics()
           log('initial', 'Invalid topics pruned')
 
-          // Only generate the FIRST 3 topic cards so status becomes 'ready' fast
-          log('initial', 'Generating first 3 homepage cards (concurrency 3)')
+          // Generate first 3 cards in parallel
+          log('initial', 'Generating first 3 homepage cards (concurrency 4)')
           await regenerateHomepageCards(3)
           log('initial', 'Initial card generation complete')
 
           await recordIngestionRun('success', {
             segment: 'initial',
-            provider: 'gnews',
-            article_count: p1.articles.length,
+            providers: ['gnews', 'newsdata'],
+            article_count: chunk1Articles.length,
           }).catch(() => undefined)
           log('initial', 'Ingestion run recorded')
         } else {
-          log('initial', 'GNews returned 0 articles — no cards generated this segment')
+          log('initial', 'Both GNews and NewsData returned 0 articles')
         }
 
       } else if (segment === 'rest') {
-        // ── Rest segment: NewsData + Currents concurrently → remaining cards ─
-        log('rest', 'Fetching NewsData + Currents in parallel')
+        // ── Chunk 2: Currents News (fetched on-demand when user clicks fetch more) ─
+        log('rest', 'Fetching Chunk 2 (Currents News)')
         const t0 = Date.now()
-        const [res2, res3] = await Promise.all([
-          fetchNewsData().catch((err) => { logErr('rest', 'NewsData fetch failed', err); return null }),
-          fetchCurrents().catch((err) => { logErr('rest', 'Currents fetch failed', err); return null }),
-        ])
-        log('rest', `Parallel fetch done in ${Date.now() - t0}ms — NewsData:${res2?.articles.length ?? 'failed'} Currents:${res3?.articles.length ?? 'failed'}`)
+        const p3 = await fetchCurrents().catch((err) => { logErr('rest', 'Currents fetch failed', err); return null })
+        const chunk2Articles = p3?.articles ?? []
+        log('rest', `Chunk 2 returned ${chunk2Articles.length} articles in ${Date.now() - t0}ms`)
 
-        let newArticlesCount = 0
-        if (res2 && res2.articles.length) {
-          await upsertArticlesAndTopics(res2.articles)
-          newArticlesCount += res2.articles.length
-          log('rest', `Upserted ${res2.articles.length} NewsData articles`)
-        }
-        if (res3 && res3.articles.length) {
-          await upsertArticlesAndTopics(res3.articles)
-          newArticlesCount += res3.articles.length
-          log('rest', `Upserted ${res3.articles.length} Currents articles`)
-        }
-
-        if (newArticlesCount > 0) {
-          log('rest', `Total new articles: ${newArticlesCount} — pruning invalid topics`)
+        if (chunk2Articles.length > 0) {
+          await upsertArticlesAndTopics(chunk2Articles)
           await deleteInvalidTopics()
-          // Generate ALL remaining uncached topics (higher concurrency since Render has more time)
-          log('rest', 'Generating remaining homepage cards (concurrency 4, no limit)')
-          await regenerateHomepageCards() // no limit — generate all
-          log('rest', 'Rest card generation complete')
+          log('rest', 'Generating next homepage cards')
+          await generateMoreHomepageCards(3)
           await recordIngestionRun('success', {
             segment: 'rest',
-            providers: ['newsdata', 'currents'],
-            article_count: newArticlesCount,
+            providers: ['currents'],
+            article_count: chunk2Articles.length,
           }).catch(() => undefined)
           log('rest', 'Ingestion run recorded')
         } else {
-          log('rest', 'Both NewsData and Currents returned 0 articles')
+          log('rest', 'Currents returned 0 articles')
         }
 
       } else {
-        // ── Full refresh: all providers, safe (no pre-clear) ──────────────
-        log('all', 'Running full ingest across all providers')
-        await ingest()
-        log('all', 'Full ingest complete — pruning invalid topics')
-        await deleteInvalidTopics()
-        log('all', 'Generating all homepage cards (concurrency 4)')
-        await regenerateHomepageCards()
-        log('all', 'Full card regeneration complete')
+        // ── Full / Initial Chunk: GNews + NewsData first so cards are ready fast ─
+        log('all', 'Running Chunk 1 (GNews + NewsData in parallel)')
+        const [p1, p2] = await Promise.all([
+          fetchGNews().catch(() => null),
+          fetchNewsData().catch(() => null),
+        ])
+        const chunk1Articles = [...(p1?.articles ?? []), ...(p2?.articles ?? [])]
+        if (chunk1Articles.length > 0) {
+          await upsertArticlesAndTopics(chunk1Articles)
+          await deleteInvalidTopics()
+          await regenerateHomepageCards(3)
+          await recordIngestionRun('success', {
+            segment: 'initial',
+            providers: ['gnews', 'newsdata'],
+            article_count: chunk1Articles.length,
+          }).catch(() => undefined)
+        }
       }
     } else {
-      log('refreshSegment', 'Data is still fresh — no action needed')
+      // Data is fresh, but verify cache has at least 3 stories:
+      const existing = await getHomeStories(3, 0)
+      if (existing.length < 3) {
+        log('refreshSegment', `Cache has only ${existing.length} stories — generating cards from existing topics in DB`)
+        await regenerateHomepageCards(3)
+      } else {
+        log('refreshSegment', `Data is still fresh and cache has ${existing.length} stories — no action needed`)
+      }
     }
 
-    const stories = await getHomeStories()
-    log('refreshSegment', `Segment="${segment}" done — ${stories.length} stories in cache`)
+    const stories = await getHomeStories(10, 0)
+    log('refreshSegment', `Segment="${segment}" complete — ${stories.length} stories in cache`)
     return { story_count: stories.length }
   } catch (err) {
     logErr('refreshSegment', `Segment="${segment}" threw`, err)
@@ -241,32 +255,44 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'all'
 }
 
 export async function refreshHomepageCategory() {
-  return refreshSegment('all')
+  return refreshSegment('initial')
 }
 
 // ── Homepage card generation ───────────────────────────────────────────────────
 
 /**
  * Regenerate homepage cards.
- * @param limit  Max number of topics to process. Pass undefined for all.
+ * @param limit  Max number of cards to generate. Defaults to 3.
  */
-export async function regenerateHomepageCards(limit?: number) {
-  log('regen', `Loading topics to generate cards for${limit !== undefined ? ` (limit ${limit})` : ' (all)'}`)
-  const topics = await getTopicsNeedingHomepageCards(limit)
-  log('regen', `${topics.length} topics to process`)
+export async function regenerateHomepageCards(limit = 3) {
+  log('regen', `Loading topics to generate cards for (limit ${limit})`)
+  const candidateTopics = await getTopicsNeedingHomepageCards(limit * 3)
+  log('regen', `${candidateTopics.length} candidate topics to check`)
 
-  if (!topics.length) {
-    log('regen', 'No topics found — nothing to generate')
+  if (!candidateTopics.length) {
+    log('regen', 'No topics found in DB — nothing to generate')
     return []
   }
 
-  const generated = await mapWithConcurrency(topics, 4, async (topic) => {
-    const articles = await getArticlesForTopic(topic.id)
-    if (articles.length < 2) {
-      log('regen', `Skipping "${topic.title_hint}" — ${articles.length} article(s) (need ≥2)`)
-      return null
-    }
-    log('regen', `→ Generating card for "${topic.title_hint}" (${articles.length} articles)`)
+  // Load articles for all candidate topics in parallel
+  const topicArticles = await Promise.all(
+    candidateTopics.map(async (topic) => ({
+      topic,
+      articles: await getArticlesForTopic(topic.id),
+    })),
+  )
+
+  // Prioritize topics with >= 2 sources (Mosaic comparison),
+  // but allow single-source topics if needed so the feed is never empty.
+  const multiSource = topicArticles.filter((t) => t.articles.length >= 2)
+  const singleSource = topicArticles.filter((t) => t.articles.length === 1)
+  const selected = [...multiSource, ...singleSource].slice(0, limit)
+
+  log('regen', `Selected ${selected.length} topics (multi-source: ${multiSource.length}, single-source: ${singleSource.length})`)
+
+  const generated = await mapWithConcurrency(selected, 4, async ({ topic, articles }) => {
+    if (articles.length === 0) return null
+    log('regen', `→ Generating card for "${topic.title_hint}" (${articles.length} article(s))`)
     const t0 = Date.now()
     try {
       const card = await generateHomepageCardForTopic({
@@ -282,9 +308,11 @@ export async function regenerateHomepageCards(limit?: number) {
   })
 
   const stories = generated.filter(Boolean) as HomeStory[]
-  log('regen', `Generated ${stories.length}/${topics.length} cards successfully — upserting to cache`)
-  await upsertHomepageCards(stories)
-  log('regen', 'Cache upsert complete')
+  log('regen', `Generated ${stories.length}/${selected.length} cards — upserting to cache`)
+  if (stories.length > 0) {
+    await upsertHomepageCards(stories)
+    log('regen', 'Cache upsert complete')
+  }
   return stories
 }
 

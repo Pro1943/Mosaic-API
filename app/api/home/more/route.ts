@@ -1,6 +1,6 @@
 import { after, NextResponse } from 'next/server'
 import { toMosaicError } from '@/lib/mosaic/env'
-import { generateMoreHomepageCards, getCachedHomepage } from '@/lib/mosaic/pipeline'
+import { generateMoreHomepageCards, getCachedHomepage, refreshSegment } from '@/lib/mosaic/pipeline'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -25,9 +25,16 @@ export async function GET(request: Request) {
       console.log(`[HomeMore][${ts()}] No cached stories at offset=${offset} — scheduling background generation`)
       after(async () => {
         console.log(`[HomeMore][${ts()}] Background: generating ${CHUNK_SIZE} more homepage cards`)
-        await generateMoreHomepageCards(CHUNK_SIZE).catch((err) => {
+        const generated = await generateMoreHomepageCards(CHUNK_SIZE).catch((err) => {
           console.error(`[HomeMore][${ts()}] Generating more homepage cards failed:`, err)
+          return []
         })
+        if (generated.length === 0) {
+          console.log(`[HomeMore][${ts()}] No uncached topics left — fetching Chunk 2 (Currents News)`)
+          await refreshSegment('rest').catch((err) => {
+            console.error(`[HomeMore][${ts()}] Rest segment refresh failed:`, err)
+          })
+        }
       })
       return NextResponse.json({ stories: [], status: 'processing' })
     }
