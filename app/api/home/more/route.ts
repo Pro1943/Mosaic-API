@@ -40,7 +40,9 @@ export async function GET(request: Request) {
     }
 
     console.log(`[HomeMore][${ts()}] Responding with ${stories.length} stories (took ${Date.now() - t0}ms)`)
-    return NextResponse.json({ stories, status: 'ready' })
+    const res = NextResponse.json({ stories, status: 'ready' })
+    res.headers.set('Cache-Control', 's-maxage=30, stale-while-revalidate=60, stale-if-error=300')
+    return res
   } catch (error) {
     console.error(`[HomeMore][${ts()}] GET /api/home/more threw:`, error)
     return NextResponse.json({ error: toMosaicError(error, 'HOME_MORE_FAILED') }, { status: 500 })

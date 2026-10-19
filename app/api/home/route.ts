@@ -1,13 +1,13 @@
 import { after, NextResponse } from 'next/server'
 import { toMosaicError } from '@/lib/mosaic/env'
 import { getCachedHomepage, refreshSegment } from '@/lib/mosaic/pipeline'
-import { getLastIngestionAt } from '@/lib/mosaic/db'
+import { getLastIngestionAt, FRESHNESS_THRESHOLD_MS } from '@/lib/mosaic/db'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-// Stories are stale if the last ingestion success was more than 15 minutes ago
-const STALE_MS = 15 * 60 * 1000
+// Stories are stale if the last ingestion success was more than 1 hour ago (aligned with status endpoint)
+const STALE_MS = FRESHNESS_THRESHOLD_MS
 // Number of stories to return in the initial/rest response (user sees these first)
 const INITIAL_CHUNK = 3
 
@@ -52,7 +52,11 @@ export async function GET(request: Request) {
     const status = stories.length === 0 ? 'processing' : isStale ? 'refreshing' : 'ready'
     console.log(`[Home][${ts()}] Responding: status=${status} stories=${stories.length} (took ${Date.now() - t0}ms)`)
 
-    return NextResponse.json({ stories, status })
+    // 7.3: CDN-level short cache — prevents thundering herd while keeping data fresh.
+    // force-dynamic prevents Next.js from caching, but Render/Vercel edge will use this header.
+    const res = NextResponse.json({ stories, status })
+    res.headers.set('Cache-Control', 's-maxage=30, stale-while-revalidate=60, stale-if-error=300')
+    return res
   } catch (error) {
     console.error(`[Home][${ts()}] GET /api/home threw:`, error)
     return NextResponse.json({ error: toMosaicError(error, 'HOME_FEED_FAILED') }, { status: 500 })

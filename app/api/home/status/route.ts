@@ -1,13 +1,17 @@
 import { after, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/mosaic/supabase'
-import { acquireIngestionLease, getLastIngestionAt, getHomeStories } from '@/lib/mosaic/db'
+import { getLastIngestionAt, getHomeStories, FRESHNESS_THRESHOLD_MS } from '@/lib/mosaic/db'
 import { refreshSegment } from '@/lib/mosaic/pipeline'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-// Cache is considered stale after 1 hour (matches ONE_HOUR_MS in db.ts)
-const FRESHNESS_THRESHOLD_MS = 60 * 60 * 1000
+// Minimum cached stories required to declare the feed "ready"
+const MIN_STORIES_FOR_READY = 3
+
+// In-memory debounce so rapid client polling doesn't spawn concurrent refreshSegment calls
+let lastRefreshTriggerTime = 0
+const REFRESH_TRIGGER_COOLDOWN_MS = 60 * 1000
 
 /**
  * GET /api/home/status
@@ -60,28 +64,33 @@ export async function GET() {
     console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Last ingestion: ${lastIngestion?.toISOString() ?? 'never'} (age: ${ageSeconds ?? 'n/a'}s)`)
 
     // ── 3. Current story count in homepage_story_cache ─────────────────────
-    // Use a high limit just to get the count — we don't return stories here
     const stories = await getHomeStories(20, 0).catch(() => [])
     const storyCount = stories.length
 
     console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Story count in cache: ${storyCount}`)
 
-    // ── 4. Derive status ───────────────────────────────────────────────────
-    // Ready = active lock resolved, last ingestion <1h ago, and at least 3 stories cached.
-    // We only need 3 because the initial segment generates 3 cards before returning.
-    const MIN_STORIES_FOR_READY = 3
+    // ── 4. Derive status & trigger background refresh safely ───────────────
     let status: 'ready' | 'refreshing' | 'stale' | 'error'
+    const isDataStale = !lastIngestion || ageMs === null || ageMs > FRESHNESS_THRESHOLD_MS || storyCount < MIN_STORIES_FOR_READY
 
     if (activeLock) {
       status = 'refreshing'
-    } else if (!lastIngestion || ageMs === null || ageMs > FRESHNESS_THRESHOLD_MS || storyCount < MIN_STORIES_FOR_READY) {
-      status = 'stale'
-      console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Status=stale — triggering background refresh`)
-      after(async () => {
-        await refreshSegment('initial').catch((err) => {
-          console.error(`[Status][${new Date().toISOString().slice(11, 23)}] Background refresh failed:`, err)
+    } else if (isDataStale) {
+      const timeSinceLastTrigger = now - lastRefreshTriggerTime
+      if (timeSinceLastTrigger < REFRESH_TRIGGER_COOLDOWN_MS) {
+        // A refresh was already scheduled recently; report refreshing to client and prevent duplicate task
+        console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Refresh already scheduled ${Math.round(timeSinceLastTrigger / 1000)}s ago — reporting refreshing`)
+        status = 'refreshing'
+      } else {
+        lastRefreshTriggerTime = now
+        status = 'refreshing'
+        console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Data is stale — scheduling single background refresh`)
+        after(async () => {
+          await refreshSegment('initial').catch((err) => {
+            console.error(`[Status][${new Date().toISOString().slice(11, 23)}] Background refresh failed:`, err)
+          })
         })
-      })
+      }
     } else {
       status = 'ready'
     }

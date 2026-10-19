@@ -100,11 +100,14 @@ export async function generateMoreHomepageCards(count = 3): Promise<HomeStory[]>
     })),
   )
 
-  const multiSource = topicArticles.filter((t) => t.articles.length >= 2)
-  const singleSource = topicArticles.filter((t) => t.articles.length === 1)
-  const selected = [...multiSource, ...singleSource].slice(0, count)
+  // Only select topics with >= 2 distinct sources (Mosaic comparison requires multi-source)
+  const multiSource = topicArticles.filter((t) => {
+    const uniqueSources = new Set(t.articles.map((a) => a.source.toLowerCase().trim()))
+    return t.articles.length >= 2 && uniqueSources.size >= 2
+  })
+  const selected = multiSource.slice(0, count)
 
-  log('generateMore', `Selected ${selected.length} topics (multi: ${multiSource.length}, single: ${singleSource.length})`)
+  log('generateMore', `Selected ${selected.length} multi-source topics for cards`)
 
   const generated = await mapWithConcurrency(selected, 4, async ({ topic, articles }) => {
     if (articles.length === 0) return null
@@ -139,14 +142,9 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'init
   const acquired = await acquireIngestionLease()
   if (!acquired) {
     log('refreshSegment', 'Could not acquire lease — another refresh is running')
-    const stale = await needsIngestion()
-    if (!stale) {
-      const existing = await getHomeStories(3, 0)
-      log('refreshSegment', `Lease busy but data is fresh — ${existing.length} stories available`)
-      return { story_count: existing.length }
-    }
-    log('refreshSegment', 'Lease busy and data is stale — releasing stale lock and retrying')
-    await releaseIngestionLease().catch(() => undefined)
+    const existing = await getHomeStories(3, 0).catch(() => [])
+    log('refreshSegment', `Lease busy — returning ${existing.length} existing stories`)
+    return { story_count: existing.length }
   }
 
   try {
@@ -282,13 +280,14 @@ export async function regenerateHomepageCards(limit = 3) {
     })),
   )
 
-  // Prioritize topics with >= 2 sources (Mosaic comparison),
-  // but allow single-source topics if needed so the feed is never empty.
-  const multiSource = topicArticles.filter((t) => t.articles.length >= 2)
-  const singleSource = topicArticles.filter((t) => t.articles.length === 1)
-  const selected = [...multiSource, ...singleSource].slice(0, limit)
+  // Only select topics with >= 2 distinct sources (Mosaic comparison requires multi-source)
+  const multiSource = topicArticles.filter((t) => {
+    const uniqueSources = new Set(t.articles.map((a) => a.source.toLowerCase().trim()))
+    return t.articles.length >= 2 && uniqueSources.size >= 2
+  })
+  const selected = multiSource.slice(0, limit)
 
-  log('regen', `Selected ${selected.length} topics (multi-source: ${multiSource.length}, single-source: ${singleSource.length})`)
+  log('regen', `Selected ${selected.length} multi-source topics for cards`)
 
   const generated = await mapWithConcurrency(selected, 4, async ({ topic, articles }) => {
     if (articles.length === 0) return null

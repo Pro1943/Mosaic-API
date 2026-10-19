@@ -1,34 +1,46 @@
 import { NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/mosaic/supabase'
+import { deleteInvalidTopics } from '@/lib/mosaic/db'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 const THIRTY_ONE_DAYS_MS = 31 * 24 * 60 * 60 * 1000
 
+function isAuthorized(request: Request): boolean {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    // If no CRON_SECRET configured, only allow in local development
+    return process.env.NODE_ENV !== 'production'
+  }
+  const authHeader = request.headers.get('authorization')
+  const cronHeader = request.headers.get('x-cron-secret')
+  return authHeader === `Bearer ${secret}` || cronHeader === secret
+}
+
 /**
  * POST /api/maintenance/flush-articles
  *
- * Clears `news_articles`, `topic_articles`, and `topics` when the oldest
- * article in `news_articles` is 31 or more days old.
- *
- * This is a periodic deep-clean to prevent unbounded table growth.
- * It cascades through: topics → topic_articles → news_articles (in order,
- * to avoid FK constraint failures depending on your Supabase cascade config).
- *
- * Response: { flushed: boolean, reason: string, oldestArticleAgeSeconds?: number }
+ * Safely prunes `news_articles` published 31 or more days ago,
+ * cascading deletions to topic links and pruning orphaned topics.
+ * Does NOT wipe active/recent news articles.
+ * Requires bearer authorization via CRON_SECRET in production.
  */
-export async function POST() {
+export async function POST(request: Request) {
+  if (!isAuthorized(request)) {
+    return NextResponse.json({ flushed: false, error: 'Unauthorized' }, { status: 401 })
+  }
+
   try {
     const supabase = getSupabaseAdmin()
+    const cutoffDate = new Date(Date.now() - THIRTY_ONE_DAYS_MS).toISOString()
 
-    // Find the oldest article by published_at (fall back to created_at if needed)
-    const { data: oldest, error: selectError } = await supabase
+    // 1. Select only articles older than 31 days
+    const { data: expiredArticles, error: selectError } = await supabase
       .from('news_articles')
-      .select('published_at')
-      .order('published_at', { ascending: true })
-      .limit(1)
-      .maybeSingle()
+      .select('id')
+      .lt('published_at', cutoffDate)
+      .limit(500)
 
     if (selectError) {
       return NextResponse.json(
@@ -37,70 +49,38 @@ export async function POST() {
       )
     }
 
-    if (!oldest) {
-      return NextResponse.json({ flushed: false, reason: 'news_articles is already empty.' })
-    }
-
-    const oldestDate = oldest.published_at ? new Date(oldest.published_at) : null
-    if (!oldestDate || isNaN(oldestDate.getTime())) {
-      return NextResponse.json({ flushed: false, reason: 'Oldest article has no valid published_at timestamp.' })
-    }
-
-    const articleAge = Date.now() - oldestDate.getTime()
-    const oldestArticleAgeSeconds = Math.round(articleAge / 1000)
-
-    if (articleAge < THIRTY_ONE_DAYS_MS) {
+    if (!expiredArticles || expiredArticles.length === 0) {
       return NextResponse.json({
         flushed: false,
-        reason: `Oldest article is only ${oldestArticleAgeSeconds}s old (threshold: ${THIRTY_ONE_DAYS_MS / 1000}s). Not flushing.`,
-        oldestArticleAgeSeconds,
+        reason: 'No articles older than 31 days found.',
+        deletedCount: 0,
       })
     }
 
-    // ── Delete in dependency order ─────────────────────────────────────────
-    // 1. topic_articles (references both topics and news_articles)
-    const { error: topicArticlesError } = await supabase
-      .from('topic_articles')
-      .delete()
-      .neq('topic_id', '')
+    const expiredIds = expiredArticles.map((a) => a.id)
 
-    if (topicArticlesError) {
-      return NextResponse.json(
-        { flushed: false, reason: 'Failed to delete topic_articles: ' + topicArticlesError.message },
-        { status: 500 },
-      )
-    }
-
-    // 2. topics
-    const { error: topicsError } = await supabase
-      .from('topics')
-      .delete()
-      .neq('id', '')
-
-    if (topicsError) {
-      return NextResponse.json(
-        { flushed: false, reason: 'Failed to delete topics: ' + topicsError.message },
-        { status: 500 },
-      )
-    }
-
-    // 3. news_articles
+    // 2. Delete ONLY expired articles (topic_articles cascades via FK on article_id)
     const { error: articlesError } = await supabase
       .from('news_articles')
       .delete()
-      .neq('id', '')
+      .in('id', expiredIds)
 
     if (articlesError) {
       return NextResponse.json(
-        { flushed: false, reason: 'Failed to delete news_articles: ' + articlesError.message },
+        { flushed: false, reason: 'Failed to delete expired news_articles: ' + articlesError.message },
         { status: 500 },
       )
     }
 
+    // 3. Clean up any topics that no longer have valid clusters
+    await deleteInvalidTopics().catch((err) => {
+      console.warn('[Maintenance] deleteInvalidTopics warning after flush:', err)
+    })
+
     return NextResponse.json({
       flushed: true,
-      reason: `Oldest article was ${oldestArticleAgeSeconds}s old (>=${THIRTY_ONE_DAYS_MS / 1000}s threshold). Flushed topic_articles, topics, and news_articles.`,
-      oldestArticleAgeSeconds,
+      reason: `Successfully deleted ${expiredIds.length} articles older than 31 days and pruned orphaned topics.`,
+      deletedCount: expiredIds.length,
     })
   } catch (error) {
     console.error('[API Error] /api/maintenance/flush-articles failed:', error)

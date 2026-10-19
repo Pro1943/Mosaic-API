@@ -11,7 +11,8 @@ import type {
 } from './types'
 import { createMosaicError } from './env'
 
-const ONE_HOUR_MS = 60 * 60 * 1000
+export const FRESHNESS_THRESHOLD_MS = 60 * 60 * 1000
+const ONE_HOUR_MS = FRESHNESS_THRESHOLD_MS
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 function ts() { return new Date().toISOString().slice(11, 23) }
@@ -98,6 +99,7 @@ export async function acquireIngestionLease(leaseTimeoutMs = 5 * 60 * 1000): Pro
   }
 
   const { error } = await supabase.from('ingestion_runs').insert({
+    category: 'world',
     status: 'failed',
     details: { lock: true, started_at: now.toISOString() },
     finished_at: now.toISOString(),
@@ -135,6 +137,7 @@ export async function releaseIngestionLease() {
 export async function recordIngestionRun(status: 'success' | 'failed', details: unknown) {
   const supabase = getSupabaseAdmin()
   const { error } = await supabase.from('ingestion_runs').insert({
+    category: 'world',
     status,
     details,
     finished_at: new Date().toISOString(),
@@ -152,6 +155,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
   const supabase = getSupabaseAdmin()
   const articleRows = articles.map((article) => ({
     id: stableHash(article.url),
+    category: 'world',
     source: article.source,
     headline: article.headline,
     author: article.author,
@@ -163,7 +167,33 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
   const { error: articleError } = await supabase.from('news_articles').upsert(articleRows, { onConflict: 'url' })
   if (articleError) throw createMosaicError('SUPABASE_ARTICLE_UPSERT_FAILED', 'Could not store fetched news articles.', articleError)
 
-  const clusters = clusterArticles(articles)
+  // Retrieve recent articles from the last 48 hours to cross-cluster with all recent coverage
+  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString()
+  const { data: recentDbArticles } = await supabase
+    .from('news_articles')
+    .select('source, headline, author, published_at, body, url')
+    .gte('published_at', cutoff)
+    .limit(100)
+
+  const combinedMap = new Map<string, NormalizedArticle>()
+  for (const art of articles) combinedMap.set(art.url, art)
+  for (const row of (recentDbArticles ?? []) as ArticleRow[]) {
+    if (!combinedMap.has(row.url)) {
+      combinedMap.set(row.url, {
+        source: row.source,
+        headline: row.headline,
+        author: row.author,
+        published_at: row.published_at,
+        body: row.body,
+        url: row.url,
+      })
+    }
+  }
+
+  const allArticles = Array.from(combinedMap.values())
+  const clusters = clusterArticles(allArticles)
+  log(`upsertArticlesAndTopics → formed ${clusters.length} valid multi-source clusters from ${allArticles.length} pooled articles`)
+
   for (const cluster of clusters) {
     if (!isValidCluster(cluster)) continue
 
@@ -174,6 +204,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
     const { error: topicError } = await supabase.from('topics').upsert(
       {
         id: topicId,
+        category: 'world',
         title_hint: titleHint,
         updated_at: now,
       },
@@ -197,15 +228,28 @@ function clusterArticles(articles: NormalizedArticle[]) {
 
   for (const article of validArticles) {
     const tokens = headlineTokens(article.headline)
-    const match = clusters.find((cluster) => {
-      const primaryTokens = headlineTokens(cluster[0].headline)
-      const shared = sharedTokenCount(tokens, primaryTokens)
-      const jaccardScore = jaccard(tokens, primaryTokens)
-      return jaccardScore >= 0.25 || shared >= 2
-    })
+    let bestCluster: NormalizedArticle[] | null = null
+    let bestScore = 0
 
-    if (match) {
-      match.push(article)
+    for (const cluster of clusters) {
+      for (const member of cluster) {
+        const memberTokens = headlineTokens(member.headline)
+        const shared = sharedTokenCount(tokens, memberTokens)
+        const jaccardScore = jaccard(tokens, memberTokens)
+
+        // Match if Jaccard >= 0.20 or at least 2 significant headline tokens are shared
+        if (jaccardScore >= 0.20 || shared >= 2) {
+          const score = jaccardScore + (shared * 0.25)
+          if (score > bestScore) {
+            bestScore = score
+            bestCluster = cluster
+          }
+        }
+      }
+    }
+
+    if (bestCluster && bestScore > 0) {
+      bestCluster.push(article)
     } else {
       clusters.push([article])
     }
@@ -218,81 +262,89 @@ function sharedTokenCount(a: Set<string>, b: Set<string>) {
   return [...a].filter((token) => b.has(token)).length
 }
 
+const STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'from',
+  'that',
+  'this',
+  'are',
+  'has',
+  'have',
+  'into',
+  'over',
+  'after',
+  'before',
+  'news',
+  'daily',
+  'today',
+  'report',
+  'reports',
+  'says',
+  'said',
+  'new',
+  'first',
+  'latest',
+  'top',
+  'best',
+  'global',
+  'world',
+  'major',
+  'market',
+  'launch',
+  'launches',
+  'unveils',
+  'announces',
+  'deal',
+  'plan',
+  'rules',
+  'system',
+  'full',
+  'episode',
+  'guide',
+  'watch',
+  'live',
+  'update',
+  'updates',
+  'video',
+  'star',
+  'sign',
+  'horoscope',
+  'january',
+  'february',
+  'march',
+  'april',
+  'may',
+  'june',
+  'july',
+  'august',
+  'september',
+  'october',
+  'november',
+  'december',
+  '2024',
+  '2025',
+  '2026',
+  '2027',
+  '2028',
+])
+
+function cleanHeadline(headline: string): string {
+  // Strip publisher branding suffixes like " - Reuters", " | CNN", " — BBC News", " / AP"
+  return headline.replace(/\s*[-–—|/]\s*[^–—|-|/]{2,}$/g, '').trim()
+}
+
 function headlineTokens(headline: string) {
-  const stop = new Set([
-    'the',
-    'and',
-    'for',
-    'with',
-    'from',
-    'that',
-    'this',
-    'are',
-    'has',
-    'have',
-    'into',
-    'over',
-    'after',
-    'before',
-    'news',
-    'daily',
-    'today',
-    'report',
-    'reports',
-    'says',
-    'said',
-    'new',
-    'first',
-    'latest',
-    'top',
-    'best',
-    'global',
-    'world',
-    'major',
-    'market',
-    'launch',
-    'launches',
-    'unveils',
-    'announces',
-    'deal',
-    'plan',
-    'rules',
-    'system',
-    'full',
-    'episode',
-    'guide',
-    'watch',
-    'live',
-    'update',
-    'updates',
-    'video',
-    'star',
-    'sign',
-    'horoscope',
-    'january',
-    'february',
-    'march',
-    'april',
-    'may',
-    'june',
-    'july',
-    'august',
-    'september',
-    'october',
-    'november',
-    'december',
-    '2024',
-    '2025',
-    '2026',
-    '2027',
-    '2028',
-  ])
+  const cleaned = cleanHeadline(headline)
   return new Set(
-    headline
+    cleaned
       .toLowerCase()
       .replace(/[^a-z0-9 ]/g, ' ')
       .split(/\s+/)
-      .filter((token) => token.length > 2 && !stop.has(token)),
+      .filter((token) => token.length > 2 && !STOP_WORDS.has(token))
+      .map((token) => (token.length > 4 && token.endsWith('s') && !token.endsWith('ss') ? token.slice(0, -1) : token)),
   )
 }
 
@@ -304,7 +356,9 @@ function jaccard(a: Set<string>, b: Set<string>) {
 
 function isValidCluster(articles: NormalizedArticle[] | ArticleRow[]) {
   const newsArticles = articles.filter(isNewsLikeArticle)
-  return newsArticles.length >= 1
+  if (newsArticles.length < 2) return false
+  const uniqueSources = new Set(newsArticles.map((a) => a.source.toLowerCase().trim()))
+  return uniqueSources.size >= 2
 }
 
 function isNewsLikeArticle(article: Pick<NormalizedArticle, 'headline' | 'url' | 'body'>) {
@@ -372,12 +426,24 @@ export async function deleteInvalidTopics() {
   const { data, error } = await supabase.from('topics').select('id')
   if (error) throw createMosaicError('SUPABASE_TOPICS_SELECT_FAILED', 'Could not read topics for validation.', error)
 
+  // 4.3 fix: collect all invalid IDs first, then issue a single batch delete.
+  // This replaces the previous N+1 pattern (one DELETE per topic).
+  const invalidIds: string[] = []
   for (const topic of data ?? []) {
     const articles = await getArticlesForTopic(topic.id)
     if (!isValidCluster(articles)) {
-      const { error: deleteError } = await supabase.from('topics').delete().eq('id', topic.id)
-      if (deleteError) throw createMosaicError('SUPABASE_TOPIC_DELETE_FAILED', 'Could not delete an invalid topic cluster.', deleteError)
+      invalidIds.push(topic.id)
     }
+  }
+
+  if (invalidIds.length > 0) {
+    // Purge cached cards for invalid topics so single-source stories never show on homepage
+    await supabase.from('homepage_story_cache').delete().in('topic_id', invalidIds)
+    const { error: deleteError } = await supabase.from('topics').delete().in('id', invalidIds)
+    if (deleteError) throw createMosaicError('SUPABASE_TOPIC_DELETE_FAILED', 'Could not delete invalid topic clusters.', deleteError)
+    log(`deleteInvalidTopics → deleted ${invalidIds.length} invalid topic(s) and their cached homepage cards`)
+  } else {
+    log('deleteInvalidTopics → no invalid topics found')
   }
 }
 
@@ -445,7 +511,11 @@ export async function upsertHomepageCards(stories: HomeStory[]) {
   if (!stories.length) return
 
   const supabase = getSupabaseAdmin()
-  const { error } = await supabase.from('homepage_story_cache').upsert(stories, { onConflict: 'topic_id' })
+  const rows = stories.map((story) => ({
+    ...story,
+    category: 'world',
+  }))
+  const { error } = await supabase.from('homepage_story_cache').upsert(rows, { onConflict: 'topic_id' })
   if (error) throw createMosaicError('SUPABASE_HOME_STORIES_UPSERT_FAILED', 'Could not cache homepage stories.', error)
 }
 
@@ -488,17 +558,19 @@ export async function getTopicMeta(topicId: string): Promise<TopicMeta> {
     .sort()
     .at(-1) ?? null
 
+  const uniqueSourceCount = new Set(articles.map((a) => a.source.toLowerCase().trim())).size
+
   return {
     topic_id: topicId,
     neutral_headline: homepageStory.neutral_headline,
     snippet: homepageStory.snippet,
     published_at: published,
-    source_count: articles.length,
+    source_count: uniqueSourceCount,
     sources: articles.map<TopicSource>((article) => ({
       name: article.source,
       url: article.url,
       headline: article.headline,
-      framing: article.headline,
+      framing: article.body?.trim().slice(0, 200) ?? article.headline,
     })),
   }
 }

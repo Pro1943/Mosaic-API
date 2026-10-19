@@ -6,20 +6,31 @@ export const dynamic = 'force-dynamic'
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
+function isAuthorized(request: Request): boolean {
+  const secret = process.env.CRON_SECRET
+  if (!secret) {
+    // If no CRON_SECRET configured, only allow in local development
+    return process.env.NODE_ENV !== 'production'
+  }
+  const authHeader = request.headers.get('authorization')
+  const cronHeader = request.headers.get('x-cron-secret')
+  return authHeader === `Bearer ${secret}` || cronHeader === secret
+}
+
 /**
  * POST /api/maintenance/flush-cache
  *
- * Clears `homepage_story_cache` and `narrative_cache` when the most
- * recently updated cache entry is older than 24 hours.
- *
- * Designed to be called by the frontend before triggering a new ingestion
- * cycle when it detects the displayed stories are more than one day old.
- * It does NOT flush if the cache is still fresh — this prevents accidentally
- * wiping valid data.
- *
- * Response: { flushed: boolean, reason: string, cacheAgeSeconds?: number }
+ * Flushes stale entries from cache tables (`homepage_story_cache`,
+ * `narrative_cache`, `comparison_cache`, and `article_extractions`)
+ * when the newest cache entry is older than 24 hours.
+ * Uses date-bounded filtering rather than blanket deletes.
+ * Requires bearer authorization via CRON_SECRET in production.
  */
-export async function POST() {
+export async function POST(request: Request) {
+  if (!isAuthorized(request)) {
+    return NextResponse.json({ flushed: false, error: 'Unauthorized' }, { status: 401 })
+  }
+
   try {
     const supabase = getSupabaseAdmin()
 
@@ -49,37 +60,24 @@ export async function POST() {
     if (cacheAge < ONE_DAY_MS) {
       return NextResponse.json({
         flushed: false,
-        reason: `Cache is only ${cacheAgeSeconds}s old (threshold: ${ONE_DAY_MS / 1000}s). Not flushing.`,
+        reason: `Newest cache entry is only ${cacheAgeSeconds}s old (threshold: ${ONE_DAY_MS / 1000}s). Not flushing.`,
         cacheAgeSeconds,
       })
     }
 
-    // Cache is stale — delete both homepage_story_cache and narrative_cache
-    const { error: homeDeleteError } = await supabase
-      .from('homepage_story_cache')
-      .delete()
-      .neq('topic_id', '')
+    const cutoff = new Date(Date.now() - ONE_DAY_MS).toISOString()
 
-    if (homeDeleteError) {
-      return NextResponse.json(
-        { flushed: false, reason: 'Failed to delete homepage_story_cache: ' + homeDeleteError.message },
-        { status: 500 },
-      )
-    }
-
-    const { error: narrativeDeleteError } = await supabase
-      .from('narrative_cache')
-      .delete()
-      .neq('topic_id', '')
-
-    if (narrativeDeleteError) {
-      // Non-fatal: homepage was already cleared; log but continue
-      console.warn('[Maintenance] Failed to clear narrative_cache:', narrativeDeleteError.message)
-    }
+    // Cache is stale (> 24h) — safely flush entries older than cutoff across all cache tables
+    await Promise.allSettled([
+      supabase.from('homepage_story_cache').delete().lt('updated_at', cutoff),
+      supabase.from('narrative_cache').delete().lt('updated_at', cutoff),
+      supabase.from('comparison_cache').delete().lt('updated_at', cutoff),
+      supabase.from('article_extractions').delete().lt('updated_at', cutoff),
+    ])
 
     return NextResponse.json({
       flushed: true,
-      reason: `Cache was ${cacheAgeSeconds}s old (>${ONE_DAY_MS / 1000}s threshold). Flushed homepage_story_cache and narrative_cache.`,
+      reason: `Cache was ${cacheAgeSeconds}s old (>${ONE_DAY_MS / 1000}s threshold). Flushed stale cache entries.`,
       cacheAgeSeconds,
     })
   } catch (error) {

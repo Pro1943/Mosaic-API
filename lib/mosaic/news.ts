@@ -138,18 +138,25 @@ export async function fetchAllNews() {
 }
 
 export function dedupeArticles(articles: NormalizedArticle[]) {
-  const seen = new Map<string, NormalizedArticle>()
+  const seenByUrl = new Map<string, NormalizedArticle>()
+  const seenByHeadline = new Map<string, NormalizedArticle>()
 
   for (const article of articles) {
-    const key = article.url.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').toLowerCase()
+    const urlKey = article.url.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').toLowerCase()
     const headlineKey = article.headline.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 90)
-    const existing = seen.get(key) ?? seen.get(headlineKey)
+    const existing = seenByUrl.get(urlKey) ?? seenByHeadline.get(headlineKey)
 
     if (!existing || article.body.length > existing.body.length) {
-      seen.set(key, article)
-      seen.set(headlineKey, article)
+      if (existing) {
+        const oldUrlKey = existing.url.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').toLowerCase()
+        const oldHeadlineKey = existing.headline.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 90)
+        seenByUrl.delete(oldUrlKey)
+        seenByHeadline.delete(oldHeadlineKey)
+      }
+      seenByUrl.set(urlKey, article)
+      seenByHeadline.set(headlineKey, article)
     }
   }
 
-  return Array.from(new Set(seen.values()))
+  return Array.from(new Set(seenByUrl.values()))
 }
