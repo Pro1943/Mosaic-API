@@ -1,4 +1,5 @@
 export type NormalizedArticle = {
+  provider: 'gnews' | 'newsdata' | 'currents' | 'unknown'
   source: string
   headline: string
   author: string | null

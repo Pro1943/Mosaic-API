@@ -34,6 +34,7 @@ type TopicRow = {
 
 type ArticleRow = {
   id: string
+  provider: NormalizedArticle['provider']
   source: string
   headline: string
   author: string | null
@@ -156,6 +157,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
   const articleRows = articles.map((article) => ({
     id: stableHash(article.url),
     category: 'world',
+    provider: article.provider,
     source: article.source,
     headline: article.headline,
     author: article.author,
@@ -171,7 +173,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
   const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString()
   const { data: recentDbArticles } = await supabase
     .from('news_articles')
-    .select('source, headline, author, published_at, body, url')
+    .select('provider, source, headline, author, published_at, body, url')
     .gte('published_at', cutoff)
     .limit(100)
 
@@ -180,6 +182,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
   for (const row of (recentDbArticles ?? []) as ArticleRow[]) {
     if (!combinedMap.has(row.url)) {
       combinedMap.set(row.url, {
+        provider: row.provider ?? 'unknown',
         source: row.source,
         headline: row.headline,
         author: row.author,
@@ -192,6 +195,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
 
   const allArticles = Array.from(combinedMap.values())
   const clusters = clusterArticles(allArticles)
+  const topicIds: string[] = []
   log(`upsertArticlesAndTopics → formed ${clusters.length} valid multi-source clusters from ${allArticles.length} pooled articles`)
 
   for (const cluster of clusters) {
@@ -199,6 +203,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
 
     const titleHint = cluster[0].headline
     const topicId = `${slugify(titleHint)}-${stableHash(cluster.map((article) => article.headline).sort().join('|'))}`
+    topicIds.push(topicId)
     const now = new Date().toISOString()
 
     const { error: topicError } = await supabase.from('topics').upsert(
@@ -220,6 +225,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
     const { error: linkError } = await supabase.from('topic_articles').upsert(links, { onConflict: 'topic_id,article_id' })
     if (linkError) throw createMosaicError('SUPABASE_TOPIC_LINK_FAILED', 'Could not link articles to topics.', linkError)
   }
+  return topicIds
 }
 
 function clusterArticles(articles: NormalizedArticle[]) {
@@ -421,9 +427,12 @@ function isNewsLikeArticle(article: Pick<NormalizedArticle, 'headline' | 'url' |
   )
 }
 
-export async function deleteInvalidTopics() {
+export async function deleteInvalidTopics(topicIds?: string[]) {
+  if (topicIds && topicIds.length === 0) return
   const supabase = getSupabaseAdmin()
-  const { data, error } = await supabase.from('topics').select('id')
+  let query = supabase.from('topics').select('id')
+  if (topicIds?.length) query = query.in('id', topicIds)
+  const { data, error } = await query
   if (error) throw createMosaicError('SUPABASE_TOPICS_SELECT_FAILED', 'Could not read topics for validation.', error)
 
   // 4.3 fix: collect all invalid IDs first, then issue a single batch delete.

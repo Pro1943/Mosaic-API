@@ -52,6 +52,7 @@ export async function fetchGNews(): Promise<ProviderResult> {
   const articles = Array.isArray((data as { articles?: unknown }).articles) ? (data as { articles: Record<string, unknown>[] }).articles : []
   const normalized = articles
     .map((item) => ({
+      provider: 'gnews' as const,
       source: asText((item.source as { name?: unknown } | undefined)?.name) || 'GNews',
       headline: asText(item.title),
       author: null,
@@ -75,6 +76,7 @@ export async function fetchNewsData(): Promise<ProviderResult> {
   const results = Array.isArray((data as { results?: unknown }).results) ? (data as { results: Record<string, unknown>[] }).results : []
   const normalized = results
     .map((item) => ({
+      provider: 'newsdata' as const,
       source: asText(item.source_id) || asText(item.source_name) || 'NewsData.io',
       headline: asText(item.title),
       author: asText(Array.isArray(item.creator) ? item.creator.join(', ') : item.creator) || null,
@@ -98,6 +100,7 @@ export async function fetchCurrents(): Promise<ProviderResult> {
   const results = Array.isArray((data as { news?: unknown }).news) ? (data as { news: Record<string, unknown>[] }).news : []
   const normalized = results
     .map((item) => ({
+      provider: 'currents' as const,
       source: asText(item.author) || asText(item.source) || 'Currents News',
       headline: asText(item.title),
       author: asText(item.author) || null,

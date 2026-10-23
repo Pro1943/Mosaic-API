@@ -25,6 +25,9 @@ import type { ComparisonAnalysis, HomeStory, NarrativeAnalysis, NormalizedArticl
 
 type TopicArticleRow = Awaited<ReturnType<typeof getArticlesForTopic>>[number]
 
+const comparisonFlights = new Map<string, Promise<ComparisonAnalysis>>()
+const narrativeFlights = new Map<string, Promise<NarrativeAnalysis>>()
+
 // ── Logging ────────────────────────────────────────────────────────────────────
 
 function ts() {
@@ -54,7 +57,8 @@ export async function ingest() {
       succeeded: result.succeeded,
       failed: result.failed.map((f) => f.provider),
     })
-    await upsertArticlesAndTopics(result.articles)
+    const topicIds = await upsertArticlesAndTopics(result.articles)
+    await deleteInvalidTopics(topicIds)
     log('ingest', 'Articles and topics upserted to Supabase')
     await recordIngestionRun('success', {
       succeeded: result.succeeded,
@@ -104,7 +108,7 @@ export async function generateMoreHomepageCards(count = 3): Promise<HomeStory[]>
   const multiSource = topicArticles.filter((t) => {
     const uniqueSources = new Set(t.articles.map((a) => a.source.toLowerCase().trim()))
     return t.articles.length >= 2 && uniqueSources.size >= 2
-  })
+  }).sort((a, b) => topicQuality(b.articles) - topicQuality(a.articles))
   const selected = multiSource.slice(0, count)
 
   log('generateMore', `Selected ${selected.length} multi-source topics for cards`)
@@ -167,9 +171,9 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'init
         log('initial', `Chunk 1 returned ${chunk1Articles.length} articles in ${Date.now() - t0}ms`)
 
         if (chunk1Articles.length > 0) {
-          await upsertArticlesAndTopics(chunk1Articles)
+          const topicIds = await upsertArticlesAndTopics(chunk1Articles)
           log('initial', 'Articles upserted to Supabase')
-          await deleteInvalidTopics()
+          await deleteInvalidTopics(topicIds)
           log('initial', 'Invalid topics pruned')
 
           // Generate first 3 cards in parallel
@@ -196,8 +200,8 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'init
         log('rest', `Chunk 2 returned ${chunk2Articles.length} articles in ${Date.now() - t0}ms`)
 
         if (chunk2Articles.length > 0) {
-          await upsertArticlesAndTopics(chunk2Articles)
-          await deleteInvalidTopics()
+          const topicIds = await upsertArticlesAndTopics(chunk2Articles)
+          await deleteInvalidTopics(topicIds)
           log('rest', 'Generating next homepage cards')
           await generateMoreHomepageCards(3)
           await recordIngestionRun('success', {
@@ -219,8 +223,8 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'init
         ])
         const chunk1Articles = [...(p1?.articles ?? []), ...(p2?.articles ?? [])]
         if (chunk1Articles.length > 0) {
-          await upsertArticlesAndTopics(chunk1Articles)
-          await deleteInvalidTopics()
+          const topicIds = await upsertArticlesAndTopics(chunk1Articles)
+          await deleteInvalidTopics(topicIds)
           await regenerateHomepageCards(3)
           await recordIngestionRun('success', {
             segment: 'initial',
@@ -284,7 +288,7 @@ export async function regenerateHomepageCards(limit = 3) {
   const multiSource = topicArticles.filter((t) => {
     const uniqueSources = new Set(t.articles.map((a) => a.source.toLowerCase().trim()))
     return t.articles.length >= 2 && uniqueSources.size >= 2
-  })
+  }).sort((a, b) => topicQuality(b.articles) - topicQuality(a.articles))
   const selected = multiSource.slice(0, limit)
 
   log('regen', `Selected ${selected.length} multi-source topics for cards`)
@@ -318,6 +322,15 @@ export async function regenerateHomepageCards(limit = 3) {
 // ── Article page helpers ───────────────────────────────────────────────────────
 
 export async function getOrCreateComparison(topicId: string): Promise<ComparisonAnalysis> {
+  const active = comparisonFlights.get(topicId)
+  if (active) return active
+
+  const work = createComparison(topicId).finally(() => comparisonFlights.delete(topicId))
+  comparisonFlights.set(topicId, work)
+  return work
+}
+
+async function createComparison(topicId: string): Promise<ComparisonAnalysis> {
   const cached = await getCachedComparison(topicId)
   if (cached && cached.claims.length > 0) return cached
 
@@ -331,6 +344,15 @@ export async function getOrCreateComparison(topicId: string): Promise<Comparison
 }
 
 export async function getOrCreateNarrative(topicId: string): Promise<NarrativeAnalysis> {
+  const active = narrativeFlights.get(topicId)
+  if (active) return active
+
+  const work = createNarrative(topicId).finally(() => narrativeFlights.delete(topicId))
+  narrativeFlights.set(topicId, work)
+  return work
+}
+
+async function createNarrative(topicId: string): Promise<NarrativeAnalysis> {
   const comparison = await getOrCreateComparison(topicId)
   const cached = await getCachedNarrative(topicId)
   if (cached && cached.sections.length > 0 && cached.differs_on.trim().toLowerCase() !== 'none') return cached
@@ -372,6 +394,7 @@ async function getOrCreateSourceClaims(topicId: string) {
 
 function articleRowToNormalized(article: TopicArticleRow): NormalizedArticle {
   return {
+    provider: article.provider ?? 'unknown',
     source: article.source,
     headline: article.headline,
     author: article.author,
@@ -379,6 +402,12 @@ function articleRowToNormalized(article: TopicArticleRow): NormalizedArticle {
     body: article.body,
     url: article.url,
   }
+}
+
+function topicQuality(articles: TopicArticleRow[]) {
+  const sources = new Set(articles.map((article) => article.source.toLowerCase().trim())).size
+  const providers = new Set(articles.map((article) => article.provider).filter((provider) => provider && provider !== 'unknown')).size
+  return providers * 100 + sources * 10 + articles.length
 }
 
 async function mapWithConcurrency<Input, Output>(items: Input[], limit: number, worker: (item: Input) => Promise<Output>) {
