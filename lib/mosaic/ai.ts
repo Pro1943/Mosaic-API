@@ -141,6 +141,17 @@ async function generateJsonWithGroq<T>(
   if (!keys.length) throw createMosaicError('GROQ_API_KEY_MISSING', 'Missing a Groq API key for Groq generation.')
   if (!GROQ_MODELS.length) throw createMosaicError('GROQ_MODELS_MISSING', 'No Groq content-generation models are configured.')
 
+  const arrayResponse = validator instanceof z.ZodArray
+  const validatorSchema = validator ? z.toJSONSchema(validator) : undefined
+  const groqSchema = validatorSchema && arrayResponse
+    ? {
+        type: 'object',
+        properties: { result: validatorSchema },
+        required: ['result'],
+        additionalProperties: false,
+      }
+    : validatorSchema
+
   const failures: Array<{ model: string; error: unknown }> = []
   for (const model of GROQ_MODELS) {
     const t0 = Date.now()
@@ -159,7 +170,10 @@ async function generateJsonWithGroq<T>(
           model,
           messages: [
             { role: 'system', content: MOSAIC_SYSTEM_INSTRUCTION },
-            { role: 'user', content: prompt },
+            {
+              role: 'user',
+              content: arrayResponse ? `${prompt}\n\nReturn the requested array inside a JSON object with a single "result" property.` : prompt,
+            },
           ],
           temperature: 0.2,
           response_format: validator
@@ -168,7 +182,7 @@ async function generateJsonWithGroq<T>(
                 json_schema: {
                   name: 'mosaic_response',
                   strict: true,
-                  schema: z.toJSONSchema(validator),
+                  schema: groqSchema,
                 },
               }
             : { type: 'json_object' },
@@ -184,10 +198,11 @@ async function generateJsonWithGroq<T>(
       const text = payload.choices?.[0]?.message?.content
       if (!text) throw createMosaicError('GROQ_EMPTY_RESPONSE', `Groq ${model} returned an empty JSON response.`)
       log(`generateJsonWithGroq → ${model} responded in ${Date.now() - t0}ms (${text.length} chars)`)
-      const parsed = JSON.parse(text)
+      const parsed: unknown = JSON.parse(text)
       if (!validator) return parsed as T
 
-      const result = validator.safeParse(parsed)
+      const value = arrayResponse && parsed && typeof parsed === 'object' && 'result' in parsed ? parsed.result : parsed
+      const result = validator.safeParse(value)
       if (result.success) return result.data
       throw createMosaicError('GROQ_VALIDATION_FAILED', `Groq ${model} output failed schema validation.`, {
         validationError: result.error.issues,
