@@ -22,7 +22,7 @@ import {
 } from './db'
 import { createMosaicError } from './env'
 import { extractArticleClaims, generateHomepageCardForTopic, synthesizeComparison, writeNarrative } from './ai'
-import { fetchAllNews, fetchGNews, fetchNewsData, fetchCurrents } from './news'
+import { fetchAllNews } from './news'
 import type { ComparisonAnalysis, HomeStory, NarrativeAnalysis, NormalizedArticle } from './types'
 
 type TopicArticleRow = Awaited<ReturnType<typeof getArticlesForTopic>>[number]
@@ -161,79 +161,42 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'init
       log('refreshSegment', 'Data is stale or cache is empty — running cleanup and fetch')
       await deleteOldStories(3)
 
-      if (segment === 'initial') {
-        // ── Chunk 1: GNews + NewsData in parallel (~20 articles, fast) ─────
-        log('initial', 'Fetching Chunk 1 (GNews + NewsData in parallel)')
+      if (segment === 'initial' || segment === 'all') {
+        log(segment, 'Fetching all 3 news providers in parallel')
         const t0 = Date.now()
-        const [p1, p2] = await Promise.all([
-          fetchGNews().catch((err) => { logErr('initial', 'GNews fetch failed', err); return null }),
-          fetchNewsData().catch((err) => { logErr('initial', 'NewsData fetch failed', err); return null }),
-        ])
-        const chunk1Articles = [...(p1?.articles ?? []), ...(p2?.articles ?? [])]
-        log('initial', `Chunk 1 returned ${chunk1Articles.length} articles in ${Date.now() - t0}ms`)
+        const result = await fetchAllNews().catch((err) => {
+          logErr(segment, 'All provider fetches failed', err)
+          return null
+        })
+        const articles = result?.articles ?? []
+        log(segment, `All providers returned ${articles.length} deduplicated articles in ${Date.now() - t0}ms`, {
+          succeeded: result?.succeeded ?? [],
+          failed: result?.failed.map((provider) => provider.provider) ?? [],
+        })
 
-        if (chunk1Articles.length > 0) {
-          const topicIds = await upsertArticlesAndTopics(chunk1Articles)
-          log('initial', 'Articles upserted to Supabase')
+        if (articles.length > 0 && result) {
+          const topicIds = await upsertArticlesAndTopics(articles)
+          log(segment, 'Articles upserted to Supabase')
           await deleteInvalidTopics(topicIds)
-          log('initial', 'Invalid topics pruned')
-
-          // Generate first 3 cards in parallel
-          log('initial', 'Generating first 3 homepage cards (concurrency 4)')
+          log(segment, 'Invalid topics pruned')
+          log(segment, 'Generating first 3 homepage cards (concurrency 4)')
           await regenerateHomepageCards(3)
-          log('initial', 'Initial card generation complete')
+          log(segment, 'Initial card generation complete')
 
           await recordIngestionRun('success', {
-            segment: 'initial',
-            providers: ['gnews', 'newsdata'],
-            article_count: chunk1Articles.length,
+            segment,
+            providers: result.succeeded,
+            failed: result.failed,
+            article_count: articles.length,
           }).catch(() => undefined)
-          log('initial', 'Ingestion run recorded')
+          log(segment, 'Ingestion run recorded')
         } else {
-          log('initial', 'Both GNews and NewsData returned 0 articles')
+          log(segment, 'No articles returned by any provider')
         }
 
       } else if (segment === 'rest') {
-        // ── Chunk 2: Currents News (fetched on-demand when user clicks fetch more) ─
-        log('rest', 'Fetching Chunk 2 (Currents News)')
-        const t0 = Date.now()
-        const p3 = await fetchCurrents().catch((err) => { logErr('rest', 'Currents fetch failed', err); return null })
-        const chunk2Articles = p3?.articles ?? []
-        log('rest', `Chunk 2 returned ${chunk2Articles.length} articles in ${Date.now() - t0}ms`)
-
-        if (chunk2Articles.length > 0) {
-          const topicIds = await upsertArticlesAndTopics(chunk2Articles)
-          await deleteInvalidTopics(topicIds)
-          log('rest', 'Generating next homepage cards')
-          await generateMoreHomepageCards(3)
-          await recordIngestionRun('success', {
-            segment: 'rest',
-            providers: ['currents'],
-            article_count: chunk2Articles.length,
-          }).catch(() => undefined)
-          log('rest', 'Ingestion run recorded')
-        } else {
-          log('rest', 'Currents returned 0 articles')
-        }
-
-      } else {
-        // ── Full / Initial Chunk: GNews + NewsData first so cards are ready fast ─
-        log('all', 'Running Chunk 1 (GNews + NewsData in parallel)')
-        const [p1, p2] = await Promise.all([
-          fetchGNews().catch(() => null),
-          fetchNewsData().catch(() => null),
-        ])
-        const chunk1Articles = [...(p1?.articles ?? []), ...(p2?.articles ?? [])]
-        if (chunk1Articles.length > 0) {
-          const topicIds = await upsertArticlesAndTopics(chunk1Articles)
-          await deleteInvalidTopics(topicIds)
-          await regenerateHomepageCards(3)
-          await recordIngestionRun('success', {
-            segment: 'initial',
-            providers: ['gnews', 'newsdata'],
-            article_count: chunk1Articles.length,
-          }).catch(() => undefined)
-        }
+        log('rest', 'Refreshing additional cards from already-ingested provider articles')
+        await generateMoreHomepageCards(3)
       }
     } else {
       // Data is fresh, but verify cache has at least 3 stories:

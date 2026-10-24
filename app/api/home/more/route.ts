@@ -30,7 +30,7 @@ export async function GET(request: Request) {
           return []
         })
         if (generated.length === 0) {
-          console.log(`[HomeMore][${ts()}] No uncached topics left — fetching Chunk 2 (Currents News)`)
+          console.log(`[HomeMore][${ts()}] No uncached cards generated — refreshing cards from ingested articles`)
           await refreshSegment('rest').catch((err) => {
             console.error(`[HomeMore][${ts()}] Rest segment refresh failed:`, err)
           })
