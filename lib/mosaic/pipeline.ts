@@ -7,8 +7,10 @@ import {
   getCachedExtractions,
   getCachedNarrative,
   getHomeStories,
+  getPreferredHomeStories,
   getTopicsNeedingHomepageCards,
   getUncachedTopics,
+  isRetainedArticle,
   needsIngestion,
   recordIngestionRun,
   releaseIngestionLease,
@@ -19,7 +21,7 @@ import {
   upsertHomepageCards,
 } from './db'
 import { createMosaicError } from './env'
-import { extractArticleClaims, generateHomepageCardForTopic, synthesizeComparison, writeNarrative } from './gemini'
+import { extractArticleClaims, generateHomepageCardForTopic, synthesizeComparison, writeNarrative } from './ai'
 import { fetchAllNews, fetchGNews, fetchNewsData, fetchCurrents } from './news'
 import type { ComparisonAnalysis, HomeStory, NarrativeAnalysis, NormalizedArticle } from './types'
 
@@ -77,7 +79,7 @@ export async function ingest() {
 // ── Cached homepage ────────────────────────────────────────────────────────────
 
 export async function getCachedHomepage(limit = 3, offset = 0): Promise<HomeStory[]> {
-  const stories = await getHomeStories(limit, offset)
+  const stories = await getPreferredHomeStories(limit, offset)
 
   if (!stories.length && offset === 0) {
     throw createMosaicError('NO_HOME_STORIES', 'No homepage stories are cached yet.')
@@ -100,7 +102,7 @@ export async function generateMoreHomepageCards(count = 3): Promise<HomeStory[]>
   const topicArticles = await Promise.all(
     topics.map(async (topic) => ({
       topic,
-      articles: await getArticlesForTopic(topic.id),
+      articles: (await getArticlesForTopic(topic.id)).filter(isRetainedArticle),
     })),
   )
 
@@ -157,7 +159,7 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'init
 
     if (stale) {
       log('refreshSegment', 'Data is stale or cache is empty — running cleanup and fetch')
-      await deleteOldStories(5)
+      await deleteOldStories(3)
 
       if (segment === 'initial') {
         // ── Chunk 1: GNews + NewsData in parallel (~20 articles, fast) ─────
@@ -244,7 +246,7 @@ export async function refreshSegment(segment: 'initial' | 'rest' | 'all' = 'init
       }
     }
 
-    const stories = await getHomeStories(10, 0)
+    const stories = await getPreferredHomeStories(10, 0)
     log('refreshSegment', `Segment="${segment}" complete — ${stories.length} stories in cache`)
     return { story_count: stories.length }
   } catch (err) {
@@ -280,7 +282,7 @@ export async function regenerateHomepageCards(limit = 3) {
   const topicArticles = await Promise.all(
     candidateTopics.map(async (topic) => ({
       topic,
-      articles: await getArticlesForTopic(topic.id),
+      articles: (await getArticlesForTopic(topic.id)).filter(isRetainedArticle),
     })),
   )
 

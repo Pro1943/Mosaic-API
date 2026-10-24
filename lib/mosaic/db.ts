@@ -12,6 +12,8 @@ import type {
 import { createMosaicError } from './env'
 
 export const FRESHNESS_THRESHOLD_MS = 60 * 60 * 1000
+export const FRESH_NEWS_WINDOW_MS = 24 * 60 * 60 * 1000
+export const RETENTION_NEWS_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
 const ONE_HOUR_MS = FRESHNESS_THRESHOLD_MS
 
 // ── Logging ──────────────────────────────────────────────────────────────────
@@ -152,9 +154,11 @@ export async function recordIngestionRun(status: 'success' | 'failed', details: 
 }
 
 export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
-  log(`upsertArticlesAndTopics → ${articles.length} articles`)
+  const retainedArticles = articles.filter(isRetainedArticle)
+  log(`upsertArticlesAndTopics → ${retainedArticles.length} retained of ${articles.length} articles`)
+  if (!retainedArticles.length) return []
   const supabase = getSupabaseAdmin()
-  const articleRows = articles.map((article) => ({
+  const articleRows = retainedArticles.map((article) => ({
     id: stableHash(article.url),
     category: 'world',
     provider: article.provider,
@@ -169,8 +173,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
   const { error: articleError } = await supabase.from('news_articles').upsert(articleRows, { onConflict: 'url' })
   if (articleError) throw createMosaicError('SUPABASE_ARTICLE_UPSERT_FAILED', 'Could not store fetched news articles.', articleError)
 
-  // Retrieve recent articles from the last 48 hours to cross-cluster with all recent coverage
-  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString()
+  const cutoff = new Date(Date.now() - RETENTION_NEWS_WINDOW_MS).toISOString()
   const { data: recentDbArticles } = await supabase
     .from('news_articles')
     .select('provider, source, headline, author, published_at, body, url')
@@ -178,7 +181,7 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
     .limit(100)
 
   const combinedMap = new Map<string, NormalizedArticle>()
-  for (const art of articles) combinedMap.set(art.url, art)
+  for (const art of retainedArticles) combinedMap.set(art.url, art)
   for (const row of (recentDbArticles ?? []) as ArticleRow[]) {
     if (!combinedMap.has(row.url)) {
       combinedMap.set(row.url, {
@@ -225,6 +228,13 @@ export async function upsertArticlesAndTopics(articles: NormalizedArticle[]) {
     const { error: linkError } = await supabase.from('topic_articles').upsert(links, { onConflict: 'topic_id,article_id' })
     if (linkError) throw createMosaicError('SUPABASE_TOPIC_LINK_FAILED', 'Could not link articles to topics.', linkError)
   }
+  if (topicIds.length > 0) {
+    await Promise.all([
+      supabase.from('article_extractions').delete().in('topic_id', topicIds),
+      supabase.from('comparison_cache').delete().in('topic_id', topicIds),
+      supabase.from('narrative_cache').delete().in('topic_id', topicIds),
+    ])
+  }
   return topicIds
 }
 
@@ -243,8 +253,7 @@ function clusterArticles(articles: NormalizedArticle[]) {
         const shared = sharedTokenCount(tokens, memberTokens)
         const jaccardScore = jaccard(tokens, memberTokens)
 
-        // Match if Jaccard >= 0.20 or at least 2 significant headline tokens are shared
-        if (jaccardScore >= 0.20 || shared >= 2) {
+        if (jaccardScore >= 0.35 || (jaccardScore >= 0.2 && shared >= 3)) {
           const score = jaccardScore + (shared * 0.25)
           if (score > bestScore) {
             bestScore = score
@@ -360,6 +369,14 @@ function jaccard(a: Set<string>, b: Set<string>) {
   return union ? intersection / union : 0
 }
 
+export function isRetainedArticle(article: Pick<NormalizedArticle, 'published_at'>) {
+  if (!article.published_at) return false
+  const publishedAt = new Date(article.published_at).getTime()
+  if (Number.isNaN(publishedAt)) return false
+  const now = Date.now()
+  return publishedAt >= now - RETENTION_NEWS_WINDOW_MS && publishedAt <= now + 15 * 60 * 1000
+}
+
 function isValidCluster(articles: NormalizedArticle[] | ArticleRow[]) {
   const newsArticles = articles.filter(isNewsLikeArticle)
   if (newsArticles.length < 2) return false
@@ -470,27 +487,44 @@ export async function getTopicsNeedingHomepageCards(limit = 8) {
 }
 
 export async function getHomeStories(limit = 3, offset = 0): Promise<HomeStory[]> {
+  return queryHomeStories(limit, offset)
+}
+
+export async function getPreferredHomeStories(limit = 3, offset = 0): Promise<HomeStory[]> {
+  const freshStories = await queryHomeStories(1, 0, new Date(Date.now() - FRESH_NEWS_WINDOW_MS).toISOString())
+  if (freshStories.length > 0) {
+    return queryHomeStories(limit, offset, new Date(Date.now() - FRESH_NEWS_WINDOW_MS).toISOString())
+  }
+  return queryHomeStories(limit, offset, new Date(Date.now() - RETENTION_NEWS_WINDOW_MS).toISOString())
+}
+
+async function queryHomeStories(limit: number, offset: number, publishedSince?: string): Promise<HomeStory[]> {
   const supabase = getSupabaseAdmin()
-  const { data, error } = await supabase
+  let query = supabase
     .from('homepage_story_cache')
-    .select('topic_id, neutral_headline, snippet, source_count, sources_preview, updated_at')
-    .order('updated_at', { ascending: false })
+    .select('topic_id, neutral_headline, snippet, source_count, sources_preview, latest_published_at, updated_at')
+    .order('latest_published_at', { ascending: false })
     .order('source_count', { ascending: false })
     .range(offset, offset + limit - 1)
+
+  if (publishedSince) query = query.gte('latest_published_at', publishedSince)
+
+  const { data, error } = await query
 
   if (error) {
     logErr('getHomeStories failed', error)
     throw createMosaicError('SUPABASE_HOME_STORIES_SELECT_FAILED', 'Could not read homepage stories from Supabase.', error)
   }
-  log(`getHomeStories(limit=${limit}, offset=${offset}) → ${(data ?? []).length} stories`)
+  log(`queryHomeStories(limit=${limit}, offset=${offset}, publishedSince=${publishedSince ?? 'none'}) → ${(data ?? []).length} stories`)
   return (data ?? []) as HomeStory[]
 }
 
-export async function deleteOldStories(days = 5) {
+export async function deleteOldStories(days = 3) {
   const supabase = getSupabaseAdmin()
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
-  await supabase.from('homepage_story_cache').delete().lt('updated_at', cutoff)
+  await supabase.from('homepage_story_cache').delete().lt('latest_published_at', cutoff)
   await supabase.from('topics').delete().lt('updated_at', cutoff)
+  await supabase.from('news_articles').delete().lt('published_at', cutoff)
 }
 
 export async function getUncachedTopics(limit = 3): Promise<TopicRow[]> {
@@ -560,7 +594,7 @@ export async function getTopicMeta(topicId: string): Promise<TopicMeta> {
   if (homepageStoryError) throw createMosaicError('SUPABASE_TOPIC_SELECT_FAILED', 'Could not read topic summary from Supabase.', homepageStoryError)
   if (!homepageStory) throw createMosaicError('TOPIC_NOT_FOUND', 'No cached topic was found for this article route.', { topicId })
 
-  const articles = await getArticlesForTopic(topicId)
+  const articles = (await getArticlesForTopic(topicId)).filter(isRetainedArticle)
   const published = articles
     .map((article) => article.published_at)
     .filter(Boolean)

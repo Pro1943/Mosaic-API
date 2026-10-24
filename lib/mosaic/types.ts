@@ -19,6 +19,7 @@ export type HomeStory = {
   snippet: string
   source_count: number
   sources_preview: SourcePreview[]
+  latest_published_at: string
   updated_at: string
 }
 

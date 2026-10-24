@@ -6,16 +6,18 @@ import type { ArticleExtraction, ComparisonAnalysis, HomeStory, NarrativeAnalysi
 // ── Logging ──────────────────────────────────────────────────────────────────
 function ts() { return new Date().toISOString().slice(11, 23) }
 function log(msg: string, extra?: unknown) {
-  const line = `[Gemini][${ts()}] ${msg}`
+  const line = `[AI][${ts()}] ${msg}`
   if (extra !== undefined) console.log(line, typeof extra === 'object' ? JSON.stringify(extra) : extra)
   else console.log(line)
 }
 function logErr(msg: string, err?: unknown) {
-  console.error(`[Gemini][${ts()}] ERROR: ${msg}`, err ?? '')
+  console.error(`[AI][${ts()}] ERROR: ${msg}`, err ?? '')
 }
 
 const HOMEPAGE_MODELS = modelsFromEnv('GEMINI_HOMEPAGE_MODELS', ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash-lite'])
 const ANALYSIS_MODELS = modelsFromEnv('GEMINI_ANALYSIS_MODELS', ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash-lite'])
+const GROQ_MODELS = modelsFromEnv('GROQ_MODELS', ['openai/gpt-oss-20b'])
+  .filter((model) => model !== 'openai/gpt-oss-safeguard-20b')
 
 export const MOSAIC_SYSTEM_INSTRUCTION = `You are the central analysis engine for Mosaic, a news comparison platform.
 You must adhere strictly to these core principles across all operations:
@@ -55,6 +57,7 @@ You must adhere strictly to these core principles across all operations:
 - Never include commentary, markdown backticks, or conversational text outside the structured JSON.`
 
 let keyIndex = 0
+let groqKeyIndex = 0
 
 function getClient() {
   const keys = [
@@ -68,6 +71,14 @@ function getClient() {
   return new GoogleGenAI({ apiKey })
 }
 
+function getGroqKeys() {
+  return [
+    getOptionalEnv('GROQ_API_KEY'),
+    getOptionalEnv('GROQ_API_KEY_2'),
+    getOptionalEnv('GROQ_API_KEY_3'),
+  ].filter(Boolean) as string[]
+}
+
 function modelsFromEnv(name: string, defaults: string[]) {
   const configured = getOptionalEnv(name)
     ?.split(',')
@@ -78,6 +89,23 @@ function modelsFromEnv(name: string, defaults: string[]) {
 }
 
 async function generateJson<T>(
+  models: string[],
+  prompt: string,
+  responseSchema: Record<string, unknown>,
+  validator?: z.ZodType<T>,
+): Promise<T> {
+  if (getOptionalEnv('MOSAIC_AI_PROVIDER')?.toLowerCase() === 'groq') {
+    try {
+      return await generateJsonWithGroq<T>(prompt, responseSchema, validator)
+    } catch (error) {
+      logErr('generateJson → Groq exhausted, falling back to Gemini', normalizeGeminiError(error))
+    }
+  }
+
+  return generateJsonWithGemini<T>(models, prompt, responseSchema, validator)
+}
+
+async function generateJsonWithGemini<T>(
   models: string[],
   prompt: string,
   responseSchema: Record<string, unknown>,
@@ -102,6 +130,77 @@ async function generateJson<T>(
 
   logErr(`generateJson → ALL models failed`, { failures })
   throw createMosaicError('GEMINI_ALL_MODELS_FAILED', 'All configured Gemini models failed for this structured JSON generation.', { failures })
+}
+
+async function generateJsonWithGroq<T>(
+  prompt: string,
+  _responseSchema: Record<string, unknown>,
+  validator?: z.ZodType<T>,
+): Promise<T> {
+  const keys = getGroqKeys()
+  if (!keys.length) throw createMosaicError('GROQ_API_KEY_MISSING', 'Missing a Groq API key for Groq generation.')
+  if (!GROQ_MODELS.length) throw createMosaicError('GROQ_MODELS_MISSING', 'No Groq content-generation models are configured.')
+
+  const failures: Array<{ model: string; error: unknown }> = []
+  for (const model of GROQ_MODELS) {
+    const t0 = Date.now()
+    const keyNumber = (groqKeyIndex % keys.length) + 1
+    const apiKey = keys[groqKeyIndex % keys.length]
+    groqKeyIndex += 1
+    try {
+      log(`generateJsonWithGroq → calling ${model} with key ${keyNumber} (prompt length: ${prompt.length} chars)`)
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: MOSAIC_SYSTEM_INSTRUCTION },
+            { role: 'user', content: prompt },
+          ],
+          temperature: 0.2,
+          response_format: validator
+            ? {
+                type: 'json_schema',
+                json_schema: {
+                  name: 'mosaic_response',
+                  strict: true,
+                  schema: z.toJSONSchema(validator),
+                },
+              }
+            : { type: 'json_object' },
+        }),
+      })
+      const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } }
+      if (!response.ok) {
+        throw createMosaicError('GROQ_REQUEST_FAILED', payload.error?.message ?? `Groq request failed with ${response.status}.`, {
+          status: response.status,
+        })
+      }
+
+      const text = payload.choices?.[0]?.message?.content
+      if (!text) throw createMosaicError('GROQ_EMPTY_RESPONSE', `Groq ${model} returned an empty JSON response.`)
+      log(`generateJsonWithGroq → ${model} responded in ${Date.now() - t0}ms (${text.length} chars)`)
+      const parsed = JSON.parse(text)
+      if (!validator) return parsed as T
+
+      const result = validator.safeParse(parsed)
+      if (result.success) return result.data
+      throw createMosaicError('GROQ_VALIDATION_FAILED', `Groq ${model} output failed schema validation.`, {
+        validationError: result.error.issues,
+        textPreview: text.slice(0, 500),
+      })
+    } catch (error) {
+      const normalized = normalizeGeminiError(error)
+      logErr(`generateJsonWithGroq → ${model} failed after ${Date.now() - t0}ms`, normalized)
+      failures.push({ model, error: normalized })
+    }
+  }
+
+  throw createMosaicError('GROQ_ALL_MODELS_FAILED', 'All configured Groq models failed for this structured JSON generation.', { failures })
 }
 
 async function generateJsonWithModel<T>(
@@ -267,7 +366,7 @@ export async function generateHomepageCardForTopic(input: {
     required: ['neutral_headline', 'snippet', 'sources_preview'],
   }
 
-  const result = await generateJson<Omit<HomeStory, 'topic_id' | 'source_count' | 'updated_at'>>(
+  const result = await generateJson<Omit<HomeStory, 'topic_id' | 'source_count' | 'latest_published_at' | 'updated_at'>>(
     HOMEPAGE_MODELS,
     [
       'You produce neutral topic cards for Mosaic, a news comparison platform.',
@@ -293,8 +392,17 @@ export async function generateHomepageCardForTopic(input: {
     snippet: result.snippet,
     source_count: input.articles.length,
     sources_preview: result.sources_preview,
+    latest_published_at: latestPublishedAt(input.articles),
     updated_at: new Date().toISOString(),
   }
+}
+
+function latestPublishedAt(articles: NormalizedArticle[]) {
+  const latest = articles.reduce((latestTime, article) => {
+    const publishedAt = article.published_at ? new Date(article.published_at).getTime() : Number.NaN
+    return Number.isNaN(publishedAt) ? latestTime : Math.max(latestTime, publishedAt)
+  }, 0)
+  return latest ? new Date(latest).toISOString() : new Date().toISOString()
 }
 
 export async function extractArticleClaims(articles: NormalizedArticle[]): Promise<ArticleExtraction[]> {
@@ -381,6 +489,9 @@ export async function synthesizeComparison(extractions: ArticleExtraction[]): Pr
     [
       'Compare source claims for Mosaic.',
       'Represent disagreement. Never resolve it. Never state which source is correct.',
+      'Include every material claim from every supplied source, including source-specific details, emphasis, framing, and omissions.',
+      'For each claim, list every source that supports it in shared_by. Use a one-source shared_by list for a source-specific claim.',
+      'Only use multiple sources in shared_by when they independently support the same material claim. Do not inflate agreement by merging distinct claims.',
       'Use only the extracted source claims. Return only JSON matching the schema.',
       '',
       JSON.stringify({ extractions }),

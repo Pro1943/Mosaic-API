@@ -1,13 +1,13 @@
 import { after, NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/mosaic/supabase'
-import { getLastIngestionAt, getHomeStories, FRESHNESS_THRESHOLD_MS } from '@/lib/mosaic/db'
+import { getLastIngestionAt, getPreferredHomeStories, FRESHNESS_THRESHOLD_MS } from '@/lib/mosaic/db'
 import { refreshSegment } from '@/lib/mosaic/pipeline'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 // Minimum cached stories required to declare the feed "ready"
-const MIN_STORIES_FOR_READY = 3
+const MIN_STORIES_FOR_READY = 1
 
 // In-memory debounce so rapid client polling doesn't spawn concurrent refreshSegment calls
 let lastRefreshTriggerTime = 0
@@ -64,7 +64,7 @@ export async function GET() {
     console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Last ingestion: ${lastIngestion?.toISOString() ?? 'never'} (age: ${ageSeconds ?? 'n/a'}s)`)
 
     // ── 3. Current story count in homepage_story_cache ─────────────────────
-    const stories = await getHomeStories(20, 0).catch(() => [])
+    const stories = await getPreferredHomeStories(20, 0).catch(() => [])
     const storyCount = stories.length
 
     console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Story count in cache: ${storyCount}`)
@@ -74,16 +74,16 @@ export async function GET() {
     const isDataStale = !lastIngestion || ageMs === null || ageMs > FRESHNESS_THRESHOLD_MS || storyCount < MIN_STORIES_FOR_READY
 
     if (activeLock) {
-      status = 'refreshing'
+      status = storyCount >= MIN_STORIES_FOR_READY ? 'ready' : 'refreshing'
     } else if (isDataStale) {
       const timeSinceLastTrigger = now - lastRefreshTriggerTime
       if (timeSinceLastTrigger < REFRESH_TRIGGER_COOLDOWN_MS) {
         // A refresh was already scheduled recently; report refreshing to client and prevent duplicate task
         console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Refresh already scheduled ${Math.round(timeSinceLastTrigger / 1000)}s ago — reporting refreshing`)
-        status = 'refreshing'
+        status = storyCount >= MIN_STORIES_FOR_READY ? 'ready' : 'refreshing'
       } else {
         lastRefreshTriggerTime = now
-        status = 'refreshing'
+        status = storyCount >= MIN_STORIES_FOR_READY ? 'ready' : 'refreshing'
         console.log(`[Status][${new Date().toISOString().slice(11, 23)}] Data is stale — scheduling single background refresh`)
         after(async () => {
           await refreshSegment('initial').catch((err) => {
