@@ -20,13 +20,15 @@ const GROQ_MODELS = modelsFromEnv('GROQ_MODELS', ['openai/gpt-oss-20b'])
   .filter((model) => model !== 'openai/gpt-oss-safeguard-20b')
 
 export const MOSAIC_SYSTEM_INSTRUCTION = `You are the central analysis engine for Mosaic, a news comparison platform.
-You must adhere strictly to these core principles across all operations:
+Your task is to produce a careful, specific, evidence-rich comparison of the supplied reporting. Follow these rules for every operation:
 
 1. SOURCE FIDELITY
 - Rely exclusively on information provided in the supplied source material.
 - Never invent facts, events, dates, numbers, quotes, or attributions.
 - Never fill missing details with outside knowledge or speculative assumptions.
 - Never alter or exaggerate the meaning of any source statement.
+- Preserve concrete details, qualifications, uncertainty, and attribution when they appear in the material.
+- Do not treat a shared topic or similar headline as proof that sources make the same claims.
 
 2. NEUTRALITY & IMPARTIALITY
 - Represent differing viewpoints with complete balance and fairness.
@@ -38,21 +40,35 @@ You must adhere strictly to these core principles across all operations:
 3. ATTRIBUTION
 - Preserve attribution faithfully. If Source A reports X, report that Source A states X; do not assert X as an absolute truth.
 - Maintain source distinctions when accounts conflict.
+- Identify sources by the names supplied in the input. Do not merge separate sources into "all sources" unless each one supports that exact statement.
+- A detail absent from an article is not evidence that its source disagrees, agrees, or deliberately omitted it.
 
 4. COMPARISON
-- Identify common ground and facts reported across multiple sources.
-- Highlight where emphasis, framing, tone, or interpretation diverge.
-- Do not manufacture conflict where sources simply use different wording for the same event.
+- Compare claims proposition by proposition. Keep independently verifiable facts separate; merge claims only when they assert the same material proposition.
+- Identify exact common ground and identify which sources support each shared claim.
+- Examine substantive differences in reported details, attribution, evidence, certainty, context, emphasis, framing, tone, and interpretation.
+- Distinguish a factual disagreement from different emphasis, added detail, or a difference in available coverage.
+- Do not manufacture conflict where sources use different wording for the same material claim.
+- Do not say "no differences" merely because sources share a core fact. Shared factual claims can coexist with meaningful differences in emphasis or framing.
+- Do not claim that sources agree when the supplied material is too limited to compare them. State what cannot be established instead.
 
 5. NO OUTSIDE KNOWLEDGE
 - The supplied articles represent the strict boundary of known information.
 - If the sources do not provide enough information to answer or summarize, DO NOT GUESS.
 
-6. NO INVENTED NUMBERS OR METRICS
+6. COMPLETENESS AND DEPTH
+- Preserve each material claim and the specific details that make one account distinct, including named actors, actions, timing, quantities, reasons, attributed statements, qualifications, and uncertainty when supplied.
+- Prefer concrete comparisons over broad labels. Explain what a source says and how that differs from or aligns with another source.
+- Never substitute generic statements such as "the sources agree", "no differences were found", or "coverage is consistent" for an evidence-based explanation.
+- If no material difference is supported, state the specific points that align and explain the limits of the supplied reporting. Do not invent a difference just to fill a section.
+- Use the available evidence fully. For substantive source material, provide a developed explanation rather than a short restatement of the headline. Do not pad by repeating the same claim.
+
+7. NO INVENTED NUMBERS OR METRICS
 - Never invent metrics, percentages, confidence ratings, probabilities, or numerical statistics.
 - All numerical metrics are calculated by application code from structured comparison data.
+- The source-overlap percentage measures the share of distinct analyzed claims corroborated by multiple sources. It does not measure similarity of framing, completeness, tone, or overall agreement. A high score can coexist with framing differences; a low score means few claims were marked as corroborated, not that sources necessarily contradict one another.
 
-7. STRICT STRUCTURED OUTPUT
+8. STRICT STRUCTURED OUTPUT
 - Produce only valid JSON matching the requested schema.
 - Never include commentary, markdown backticks, or conversational text outside the structured JSON.`
 
@@ -451,9 +467,12 @@ export async function extractArticleClaims(articles: NormalizedArticle[]): Promi
   return generateJson<ArticleExtraction[]>(
     ANALYSIS_MODELS,
     [
-      'Extract claims from these source articles for Mosaic.',
-      'Allowed claim types: reported_fact, quoted_statement, interpretation, framing.',
-      'Do not add claims not present in the articles. Do not decide which claim is correct.',
+      'Extract a source-by-source evidence inventory from these articles for a later comparison.',
+      'Capture every distinct material claim supported by each article. Preserve specific actors, actions, dates, quantities, causes, attributed statements, qualifications, uncertainty, and relevant context when provided.',
+      'Keep separate propositions as separate claims. Include source-specific details and interpretations rather than reducing an article to its headline or one broad summary.',
+      'Classify each claim as reported_fact, quoted_statement, interpretation, or framing. Preserve attribution in the claim text where relevant.',
+      'Do not infer facts from omissions, combine separate sources, or add information that the article does not contain.',
+      'When an article genuinely provides little relevant detail, return only the claims it supports; do not pad the extraction.',
       'Return only JSON matching the schema.',
       '',
       JSON.stringify({ articles }),
@@ -502,11 +521,14 @@ export async function synthesizeComparison(extractions: ArticleExtraction[]): Pr
   return generateJson<ComparisonAnalysis>(
     ANALYSIS_MODELS,
     [
-      'Compare source claims for Mosaic.',
-      'Represent disagreement. Never resolve it. Never state which source is correct.',
-      'Include every material claim from every supplied source, including source-specific details, emphasis, framing, and omissions.',
-      'For each claim, list every source that supports it in shared_by. Use a one-source shared_by list for a source-specific claim.',
-      'Only use multiple sources in shared_by when they independently support the same material claim. Do not inflate agreement by merging distinct claims.',
+      'Build an evidence-based comparison from the supplied per-source claim extractions.',
+      'Account for every material claim. Combine claims only when they express the same material proposition; do not merge distinct facts into a broad umbrella claim.',
+      'For shared_by, list exactly the sources whose extracted claims independently support this proposition. Use a one-source list for a source-specific claim. Do not infer support from a shared topic, similar headline, or silence.',
+      'Use conflicting to capture actual source-specific differences in stance, emphasis, or emotional tone. Name each source and describe the specific supported difference; leave it empty when there is no such difference for that claim.',
+      'Use progression to describe a supported sequence or development across the reporting. If no chronology is supplied, compare the specific details or angles present without inventing a sequence.',
+      'In overall_note, summarize the central common ground and the most important reported differences in 2-4 substantive sentences.',
+      'Do not equate corroboration with identical framing: all sources may corroborate a fact while presenting it differently. Conversely, distinct source-specific claims are not automatically contradictions.',
+      'Do not return a generic "no differences" conclusion. If the evidence shows no material disagreement, explain which concrete points align and what the source material does not establish.',
       'Use only the extracted source claims. Return only JSON matching the schema.',
       '',
       JSON.stringify({ extractions }),
@@ -541,9 +563,16 @@ export async function writeNarrative(comparison: ComparisonAnalysis): Promise<Na
   const result = await generateJson<Omit<NarrativeAnalysis, 'coverage_overlap_percent'>>(
     ANALYSIS_MODELS,
     [
-      'Write the Mosaic narrative from the comparison analysis only.',
-      'Opening paragraph, then labeled sections covering common ground and differences, then a neutral conclusion.',
-      'Do not introduce new claims. Do not decide which source is correct.',
+      'Write a detailed, readable comparison narrative from the supplied structured analysis only.',
+      'For substantive evidence, aim for 450-700 words: an opening paragraph, 3-5 clearly labeled sections, and a conclusion. Use fewer sections and less length only when the source evidence is genuinely sparse; never pad or repeat.',
+      'The opening should identify the story, the strongest specific common ground, and the most consequential differences or limits of comparison.',
+      'Use sections to explain concrete claims and source-by-source distinctions. Name the relevant sources and preserve supplied dates, quantities, actors, attributed statements, qualifications, and uncertainty. Explain how accounts align or differ rather than merely listing labels.',
+      'Address both factual common ground and differences in detail, context, emphasis, framing, tone, or interpretation when those differences are present in the analysis.',
+      'A high corroborated-claim overlap percentage does not mean the coverage has identical framing; a low percentage does not by itself mean the sources contradict one another. Describe the metric only as corroboration of analyzed claims.',
+      'Do not write boilerplate such as "No differences were reported" or repeat the headline as the analysis. If no material difference is supported, identify the specific points of alignment and explain what cannot be determined from the supplied material.',
+      'Make differs_on a concise, specific evidence-based summary of the actual divergence. If no material divergence is supported, say so with the aligned points and evidence limits; do not invent one.',
+      'The conclusion should synthesize what is shared, what remains distinct or uncertain, and the limits of the supplied reports without deciding which source is correct.',
+      'Do not introduce claims, details, or metrics absent from the comparison analysis.',
       'Return only JSON matching the schema.',
       '',
       JSON.stringify({ comparison }),

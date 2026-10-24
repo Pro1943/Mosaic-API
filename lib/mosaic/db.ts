@@ -15,6 +15,7 @@ export const FRESHNESS_THRESHOLD_MS = 60 * 60 * 1000
 export const FRESH_NEWS_WINDOW_MS = 24 * 60 * 60 * 1000
 export const RETENTION_NEWS_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
 const ONE_HOUR_MS = FRESHNESS_THRESHOLD_MS
+const AI_ANALYSIS_CACHE_VERSION = 2
 
 // ── Logging ──────────────────────────────────────────────────────────────────
 function ts() { return new Date().toISOString().slice(11, 23) }
@@ -622,7 +623,17 @@ export async function getCachedExtractions(topicId: string): Promise<ArticleExtr
   const supabase = getSupabaseAdmin()
   const { data, error } = await supabase.from('article_extractions').select('extractions').eq('topic_id', topicId).maybeSingle()
   if (error) throw createMosaicError('SUPABASE_SOURCE_CLAIMS_SELECT_FAILED', 'Could not read cached source claim extraction.', error)
-  return (data?.extractions as ArticleExtraction[] | undefined) ?? null
+  const cached = data?.extractions
+  if (
+    !cached ||
+    typeof cached !== 'object' ||
+    Array.isArray(cached) ||
+    cached.prompt_version !== AI_ANALYSIS_CACHE_VERSION ||
+    !Array.isArray(cached.items)
+  ) {
+    return null
+  }
+  return cached.items as ArticleExtraction[]
 }
 
 export async function upsertExtractions(topicId: string, extractions: ArticleExtraction[]) {
@@ -630,7 +641,10 @@ export async function upsertExtractions(topicId: string, extractions: ArticleExt
   const { error } = await supabase.from('article_extractions').upsert(
     {
       topic_id: topicId,
-      extractions,
+      extractions: {
+        prompt_version: AI_ANALYSIS_CACHE_VERSION,
+        items: extractions,
+      },
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'topic_id' },
@@ -642,7 +656,12 @@ export async function getCachedComparison(topicId: string): Promise<ComparisonAn
   const supabase = getSupabaseAdmin()
   const { data, error } = await supabase.from('comparison_cache').select('analysis').eq('topic_id', topicId).maybeSingle()
   if (error) throw createMosaicError('SUPABASE_COMPARISON_SELECT_FAILED', 'Could not read cached comparison analysis.', error)
-  return (data?.analysis as ComparisonAnalysis | undefined) ?? null
+  const cached = data?.analysis
+  if (!cached || typeof cached !== 'object' || Array.isArray(cached) || cached.prompt_version !== AI_ANALYSIS_CACHE_VERSION) {
+    return null
+  }
+  const { prompt_version: _, ...comparison } = cached
+  return comparison as ComparisonAnalysis
 }
 
 export async function upsertComparison(topicId: string, comparison: ComparisonAnalysis) {
@@ -650,7 +669,10 @@ export async function upsertComparison(topicId: string, comparison: ComparisonAn
   const { error } = await supabase.from('comparison_cache').upsert(
     {
       topic_id: topicId,
-      analysis: comparison,
+      analysis: {
+        ...comparison,
+        prompt_version: AI_ANALYSIS_CACHE_VERSION,
+      },
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'topic_id' },
@@ -662,7 +684,12 @@ export async function getCachedNarrative(topicId: string): Promise<NarrativeAnal
   const supabase = getSupabaseAdmin()
   const { data, error } = await supabase.from('narrative_cache').select('analysis').eq('topic_id', topicId).maybeSingle()
   if (error) throw createMosaicError('SUPABASE_NARRATIVE_SELECT_FAILED', 'Could not read cached narrative analysis.', error)
-  return (data?.analysis as NarrativeAnalysis | undefined) ?? null
+  const cached = data?.analysis
+  if (!cached || typeof cached !== 'object' || Array.isArray(cached) || cached.prompt_version !== AI_ANALYSIS_CACHE_VERSION) {
+    return null
+  }
+  const { prompt_version: _, ...narrative } = cached
+  return narrative as NarrativeAnalysis
 }
 
 export async function upsertNarrative(topicId: string, narrative: NarrativeAnalysis) {
@@ -670,7 +697,10 @@ export async function upsertNarrative(topicId: string, narrative: NarrativeAnaly
   const { error } = await supabase.from('narrative_cache').upsert(
     {
       topic_id: topicId,
-      analysis: narrative,
+      analysis: {
+        ...narrative,
+        prompt_version: AI_ANALYSIS_CACHE_VERSION,
+      },
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'topic_id' },
